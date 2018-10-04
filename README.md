@@ -58,7 +58,7 @@ python main.py --mode prepro --data_file hotpot_train_v1.json --para_limit 2250 
 python main.py --mode prepro --data_file hotpot_dev_distractor_v1.json --para_limit 2250 --data_split dev
 ```
 
-Preprocess the dev set in the distractor setting:
+Preprocess the dev set in the full wiki setting:
 ```
 python main.py --mode prepro --data_file hotpot_dev_fullwiki_v1.json --data_split dev --fullwiki --para_limit 2250
 ```
