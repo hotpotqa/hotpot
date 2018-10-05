@@ -52,7 +52,7 @@ def exact_match_score(prediction, ground_truth):
 def update_answer(metrics, prediction, gold):
     em = exact_match_score(prediction, gold)
     f1, prec, recall = f1_score(prediction, gold)
-    metrics['em'] += em
+    metrics['em'] += float(em)
     metrics['f1'] += f1
     metrics['prec'] += prec
     metrics['recall'] += recall
