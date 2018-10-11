@@ -7,10 +7,12 @@ import numpy as np
 import os.path
 import argparse
 import torch
-import pickle
+# import pickle
 import torch
 import os
 from joblib import Parallel, delayed
+
+import torch
 
 nlp = spacy.blank("en")
 
@@ -303,7 +305,8 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, char2id
             'id': example['id'],
             'start_end_facts': example['start_end_facts']})
     print("Build {} / {} instances of features in total".format(total, total_))
-    pickle.dump(datapoints, open(out_file, 'wb'), protocol=-1)
+    # pickle.dump(datapoints, open(out_file, 'wb'), protocol=-1)
+    torch.save(datapoints, out_file)
 
 def save(filename, obj, message=None):
     if message is not None:

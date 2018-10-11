@@ -136,7 +136,8 @@ class DataIterator(object):
                 'all_mapping': all_mapping[:cur_bsz, :max_c_len, :max_sent_cnt]}
 
 def get_buckets(record_file):
-    datapoints = pickle.load(open(record_file, 'rb'))
+    # datapoints = pickle.load(open(record_file, 'rb'))
+    datapoints = torch.load(record_file)
     return [datapoints]
 
 def convert_tokens(eval_file, qa_id, pp1, pp2, p_type):
