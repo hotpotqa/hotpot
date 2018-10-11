@@ -41,9 +41,9 @@ a dict with the following keys:
 - `_id`: a unique id for this question-answer data point. This is useful for evaluation.
 - `question`: a string.
 - `answer`: a string. The test set does not have this key.
-- `supporting_facts`: a list. Each entry in the list is a tuple `(title, sent_id)`, where `title` denotes the title of the 
+- `supporting_facts`: a list. Each entry in the list is a list with two elements `[title, sent_id]`, where `title` denotes the title of the 
 paragraph, and `sent_id` denotes the supporting fact's id (0-based) in this paragraph. The test set does not have this key.
-- `context`: a list. Each entry is a paragraph, which is represented as a tuple `(title, sentences)` and `sentences` is a list
+- `context`: a list. Each entry is a paragraph, which is represented as a list with two elements `[title, sentences]` and `sentences` is a list
 of strings.
 
 There are other keys that are not used in our code, but might be used for other purposes:
@@ -58,7 +58,7 @@ python main.py --mode prepro --data_file hotpot_train_v1.json --para_limit 2250 
 python main.py --mode prepro --data_file hotpot_dev_distractor_v1.json --para_limit 2250 --data_split dev
 ```
 
-Preprocess the dev set in the distractor setting:
+Preprocess the dev set in the full wiki setting:
 ```
 python main.py --mode prepro --data_file hotpot_dev_fullwiki_v1.json --data_split dev --fullwiki --para_limit 2250
 ```
@@ -103,6 +103,12 @@ python hotpot_evaluate_v1.py dev_fullwiki_pred.json hotpot_dev_fullwiki_v1.json
 ```
 
 Evaluation on the test set will require submitting your code to our server. We will release more details on this very soon.
+
+## Prediction File Format
+
+The prediction files `dev_distractor_pred.json` and `dev_fullwiki_pred.json` should be JSON files with the following keys:
+- `answer`: a dict. Each key of the dict is a QA pair id, corresponding to the field `_id` in data JSON files. Each value of the dict is a string representing the predicted answer.
+- `sp`: a dict. Each key of the dict is a QA pair id, corresponding to the field `_id` in data JSON files. Each value of the dict is a list representing the predicted supporting facts. Each entry of the list is a list with two elements `[title, sent_id]`, where `title` denotes the title of the paragraph, and `sent_id` denotes the supporting fact's id (0-based) in this paragraph.
 
 ## License
 The HotpotQA dataset is distribued under the [CC BY-SA 4.0](http://creativecommons.org/licenses/by-sa/4.0/legalcode) license.
