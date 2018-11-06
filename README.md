@@ -32,7 +32,7 @@ There are three HotpotQA files:
 retrieval system. If you want to use your own IR system (which is encouraged!), you can replace the paragraphs in this json
 with your own retrieval results. Please note that the gold paragraphs might or might not be in this json because our IR system
 is pretty basic.
-- Test set in the fullwiki setting http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_test_fullwiki_v1.json Because in the fullwiki setting, you only need to submit your prediction to our evaluation server without the code, we publish the test set without the answers and supporting facts.
+- Test set in the fullwiki setting http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_test_fullwiki_v1.json Because in the fullwiki setting, you only need to submit your prediction to our evaluation server without the code, we publish the test set without the answers and supporting facts. The context in the file is paragraphs obtained using our retrieval system, which might or might not contain the gold paragraphs. Again you are encouraged to use your own IR system in this setting --- simply replace the paragraphs in this json with your own retrieval results.
 
 
 ## JSON Format
@@ -47,7 +47,7 @@ paragraph, and `sent_id` denotes the supporting fact's id (0-based) in this para
 - `context`: a list. Each entry is a paragraph, which is represented as a list with two elements `[title, sentences]` and `sentences` is a list
 of strings.
 
-There are other keys that are not used in our code, but might be used for other purposes:
+There are other keys that are not used in our code, but might be used for other purposes (note that these keys are not present in the test sets, and your model should not rely on these two keys for making preditions on the test sets):
 - `type`: either `comparison` or `bridge`, indicating the question type. (See our paper for more details).
 - `level`: one of `easy`, `medium`, and `hard`. (See our paper for more details).
 
@@ -102,8 +102,6 @@ CUDA_VISIBLE_DEVICES=0 python main.py --mode test --data_split dev --para_limit 
 --keep_prob 1.0 --sp_lambda 1.0 --save HOTPOT-20180924-160521 --prediction_file dev_fullwiki_pred.json --fullwiki
 python hotpot_evaluate_v1.py dev_fullwiki_pred.json hotpot_dev_fullwiki_v1.json
 ```
-
-Evaluation on the test set will require submitting your code to our server. We will release more details on this very soon.
 
 ## Prediction File Format
 
