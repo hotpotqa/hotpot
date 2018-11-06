@@ -26,7 +26,7 @@ Run the script to download the data, including HotpotQA data and GloVe embedding
 ```
 
 There are three HotpotQA files:
-- Training set http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_train_v1.json
+- Training set http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_train_v1.1.json
 - Dev set in the distractor setting http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json
 - Dev set in the fullwiki setting http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_fullwiki_v1.json This is just `hotpot_dev_distractor_v1.json` without the gold paragraphs, but instead with the top 10 paragraphs obtained using our
 retrieval system. If you want to use your own IR system (which is encouraged!), you can replace the paragraphs in this json
@@ -54,7 +54,7 @@ There are other keys that are not used in our code, but might be used for other 
 
 Preprocess the training and dev sets in the distractor setting:
 ```
-python main.py --mode prepro --data_file hotpot_train_v1.json --para_limit 2250 --data_split train
+python main.py --mode prepro --data_file hotpot_train_v1.1.json --para_limit 2250 --data_split train
 python main.py --mode prepro --data_file hotpot_dev_distractor_v1.json --para_limit 2250 --data_split dev
 ```
 
