@@ -47,7 +47,8 @@ def train(config):
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
-    torch.cuda.manual_seed_all(config.seed)
+    #torch.cuda.manual_seed_all(config.seed)
+    #torch.cpu.manual_seed_all(config.seed)
 
     config.save = '{}-{}'.format(config.save, time.strftime("%Y%m%d-%H%M%S"))
     create_exp_dir(config.save, scripts_to_save=['run.py', 'model.py', 'util.py', 'sp_model.py'])
@@ -78,7 +79,8 @@ def train(config):
         model = Model(config, word_mat, char_mat)
 
     logging('nparams {}'.format(sum([p.nelement() for p in model.parameters() if p.requires_grad])))
-    ori_model = model.cuda()
+    #ori_model = model.cuda()
+    ori_model = model.cpu()
     model = nn.DataParallel(ori_model)
 
     lr = config.init_lr
@@ -111,12 +113,14 @@ def train(config):
             loss_1 = (nll_sum(predict_type, q_type) + nll_sum(logit1, y1) + nll_sum(logit2, y2)) / context_idxs.size(0)
             loss_2 = nll_average(predict_support.view(-1, 2), is_support.view(-1))
             loss = loss_1 + config.sp_lambda * loss_2
-
+            print(1)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.data[0]
+            #total_loss += loss.data[0]
+            total_loss += loss.item()
+            print(2)
             global_step += 1
 
             if global_step % config.period == 0:
@@ -125,7 +129,7 @@ def train(config):
                 logging('| epoch {:3d} | step {:6d} | lr {:05.5f} | ms/batch {:5.2f} | train loss {:8.3f}'.format(epoch, global_step, lr, elapsed*1000/config.period, cur_loss))
                 total_loss = 0
                 start_time = time.time()
-
+            print(3)
             if global_step % config.checkpoint == 0:
                 model.eval()
                 metrics = evaluate_batch(build_dev_iterator(), model, 0, dev_eval_file, config)
@@ -153,6 +157,7 @@ def train(config):
                             stop_train = True
                             break
                         cur_patience = 0
+            print(4)
         if stop_train: break
     logging('best_dev_F1 {}'.format(best_dev_F1))
 
@@ -239,7 +244,8 @@ def test(config):
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
-    torch.cuda.manual_seed_all(config.seed)
+    #torch.cuda.manual_seed_all(config.seed)
+    #torch.manual_seed_all(config.seed)
 
     def logging(s, print_=True, log_=True):
         if print_:
@@ -265,7 +271,8 @@ def test(config):
         model = SPModel(config, word_mat, char_mat)
     else:
         model = Model(config, word_mat, char_mat)
-    ori_model = model.cuda()
+    #ori_model = model.cuda()
+    ori_model = model.cpu()
     ori_model.load_state_dict(torch.load(os.path.join(config.save, 'model.pt')))
     model = nn.DataParallel(ori_model)
 

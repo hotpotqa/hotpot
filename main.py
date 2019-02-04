@@ -10,15 +10,15 @@ glove_word_file = "glove.840B.300d.txt"
 word_emb_file = "word_emb.json"
 char_emb_file = "char_emb.json"
 train_eval = "train_eval.json"
-dev_eval = "dev_eval.json"
-test_eval = "test_eval.json"
+dev_eval = "train_eval.json" ###
+test_eval = "train_eval.json"
 word2idx_file = "word2idx.json"
 char2idx_file = "char2idx.json"
 idx2word_file = 'idx2word.json'
 idx2char_file = 'idx2char.json'
-train_record_file = 'train_record.pkl'
-dev_record_file = 'dev_record.pkl'
-test_record_file = 'test_record.pkl'
+train_record_file = 'train_record.pkl' ###
+dev_record_file = 'train_record.pkl'
+test_record_file = 'train_record.pkl'
 
 
 parser.add_argument('--mode', type=str, default='train')

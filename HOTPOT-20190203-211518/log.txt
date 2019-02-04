@@ -1,0 +1,41 @@
+Config
+    - mode : train
+    - data_file : None
+    - glove_word_file : glove.840B.300d.txt
+    - save : HOTPOT-20190203-211518
+    - word_emb_file : word_emb.json
+    - char_emb_file : char_emb.json
+    - train_eval_file : train_eval.json
+    - dev_eval_file : train_eval.json
+    - test_eval_file : train_eval.json
+    - word2idx_file : word2idx.json
+    - char2idx_file : char2idx.json
+    - idx2word_file : idx2word.json
+    - idx2char_file : idx2char.json
+    - train_record_file : train_record.pkl
+    - dev_record_file : train_record.pkl
+    - test_record_file : train_record.pkl
+    - glove_char_size : 94
+    - glove_word_size : 2200000
+    - glove_dim : 300
+    - char_dim : 8
+    - para_limit : 2250
+    - ques_limit : 80
+    - sent_limit : 100
+    - char_limit : 16
+    - batch_size : 24
+    - checkpoint : 1000
+    - period : 100
+    - init_lr : 0.1
+    - keep_prob : 1.0
+    - hidden : 80
+    - char_hidden : 100
+    - patience : 1
+    - seed : 13
+    - sp_lambda : 1.0
+    - data_split : train
+    - fullwiki : False
+    - prediction_file : None
+    - sp_threshold : 0.3
+Building model...
+nparams 970946
