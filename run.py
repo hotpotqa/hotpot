@@ -139,7 +139,7 @@ def train(config):
                 total_loss = 0
                 start_time = time.time()
 
-            if global_step % 1 == 0:
+            if global_step % config.checkpoint == 0:
                 model.eval()
                 metrics = evaluate_batch(build_dev_iterator(), model, 1, dev_eval_file, config, global_step, tbx)
                 model.train()
@@ -148,11 +148,12 @@ def train(config):
                 logging('| eval {:6d} in epoch {:3d} | time: {:5.2f}s | dev loss {:8.3f} | EM {:.4f} | F1 {:.4f}'.format(global_step//config.checkpoint,
                     epoch, time.time()-eval_start_time, metrics['loss'], metrics['exact_match'], metrics['f1']))
                 logging('-' * 89)
-                #tbx.add_scalar('loss', metrics['loss'], global_step)
-                #tbx.add_scalar('f1', metrics['f1'], global_step)
+
+
                 for k, v in metrics.items():
                     tbx.add_scalar('dev/{}'.format(k), v, global_step)
                 eval_start_time = time.time()
+                
                 dev_F1 = metrics['f1']
                 if best_dev_F1 is None or dev_F1 > best_dev_F1:
                     best_dev_F1 = dev_F1
