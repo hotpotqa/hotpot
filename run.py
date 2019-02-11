@@ -81,8 +81,8 @@ def train(config):
         model = Model(config, word_mat, char_mat)
 
     logging('nparams {}'.format(sum([p.nelement() for p in model.parameters() if p.requires_grad])))
-    #ori_model = model.cuda()
-    ori_model = model.cpu()
+    ori_model = model.cuda()
+    #ori_model = model.cpu()
     model = nn.DataParallel(ori_model)
 
     lr = config.init_lr
