@@ -111,20 +111,26 @@ def train(config):
             end_mapping = Variable(data['end_mapping'])
             all_mapping = Variable(data['all_mapping'])
 
+            model_starting_time = time.time()
+
             logit1, logit2, predict_type, predict_support = model(context_idxs, ques_idxs, context_char_idxs, ques_char_idxs, context_lens, start_mapping, end_mapping, all_mapping, return_yp=False)
             loss_1 = (nll_sum(predict_type, q_type) + nll_sum(logit1, y1) + nll_sum(logit2, y2)) / context_idxs.size(0)
             loss_2 = nll_average(predict_support.view(-1, 2), is_support.view(-1))
             loss = loss_1 + config.sp_lambda * loss_2
             tbx.add_scalar('loss', loss, global_step)
-            print(1)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            model_backprop_time = time.time()
+
             #total_loss += loss.data[0]
             total_loss += loss.item()
-            print(2)
+
             global_step += 1
+
+            print('training 1 batch time is ', model_backprop_time - model_starting_time)
 
             if global_step % config.period == 0:
                 cur_loss = total_loss / config.period
@@ -132,7 +138,7 @@ def train(config):
                 logging('| epoch {:3d} | step {:6d} | lr {:05.5f} | ms/batch {:5.2f} | train loss {:8.3f}'.format(epoch, global_step, lr, elapsed*1000/config.period, cur_loss))
                 total_loss = 0
                 start_time = time.time()
-            print(3)
+
             if global_step % 1 == 0:
                 model.eval()
                 metrics = evaluate_batch(build_dev_iterator(), model, 1, dev_eval_file, config, global_step, tbx)
@@ -160,9 +166,10 @@ def train(config):
                             param_group['lr'] = lr
                         if lr < config.init_lr * 1e-2:
                             stop_train = True
+                            print('lr ',lr)
                             break
                         cur_patience = 0
-            print(4)
+
         if stop_train: break
     logging('best_dev_F1 {}'.format(best_dev_F1))
 
