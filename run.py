@@ -313,8 +313,8 @@ def test(config):
         model = SPModel(config, word_mat, char_mat)
     else:
         model = Model(config, word_mat, char_mat)
-    #ori_model = model.cuda()
-    ori_model = model.cpu()
+    ori_model = model.cuda()
+    #ori_model = model.cpu()
     ori_model.load_state_dict(torch.load(os.path.join(config.save, 'model.pt')))
     model = nn.DataParallel(ori_model)
 
