@@ -48,7 +48,7 @@ def train(config):
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
-    #torch.cuda.manual_seed_all(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
     #torch.cpu.manual_seed_all(config.seed)
 
     config.save = '{}-{}'.format(config.save, time.strftime("%Y%m%d-%H%M%S"))
