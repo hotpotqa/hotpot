@@ -17,6 +17,7 @@ import torch
 from torch.autograd import Variable
 import sys
 from torch.nn import functional as F
+from tensorboardX import SummaryWriter
 
 def create_exp_dir(path, scripts_to_save=None):
     if not os.path.exists(path):
@@ -51,6 +52,7 @@ def train(config):
     #torch.cpu.manual_seed_all(config.seed)
 
     config.save = '{}-{}'.format(config.save, time.strftime("%Y%m%d-%H%M%S"))
+    tbx = SummaryWriter(config.save)
     create_exp_dir(config.save, scripts_to_save=['run.py', 'model.py', 'util.py', 'sp_model.py'])
     def logging(s, print_=True, log_=True):
         if print_:
@@ -113,6 +115,7 @@ def train(config):
             loss_1 = (nll_sum(predict_type, q_type) + nll_sum(logit1, y1) + nll_sum(logit2, y2)) / context_idxs.size(0)
             loss_2 = nll_average(predict_support.view(-1, 2), is_support.view(-1))
             loss = loss_1 + config.sp_lambda * loss_2
+            tbx.add_scalar('loss', loss, global_step)
             print(1)
             optimizer.zero_grad()
             loss.backward()
@@ -130,18 +133,20 @@ def train(config):
                 total_loss = 0
                 start_time = time.time()
             print(3)
-            if global_step % config.checkpoint == 0:
+            if global_step % 1 == 0:
                 model.eval()
-                metrics = evaluate_batch(build_dev_iterator(), model, 0, dev_eval_file, config)
+                metrics = evaluate_batch(build_dev_iterator(), model, 1, dev_eval_file, config, global_step, tbx)
                 model.train()
 
                 logging('-' * 89)
                 logging('| eval {:6d} in epoch {:3d} | time: {:5.2f}s | dev loss {:8.3f} | EM {:.4f} | F1 {:.4f}'.format(global_step//config.checkpoint,
                     epoch, time.time()-eval_start_time, metrics['loss'], metrics['exact_match'], metrics['f1']))
                 logging('-' * 89)
-
+                #tbx.add_scalar('loss', metrics['loss'], global_step)
+                #tbx.add_scalar('f1', metrics['f1'], global_step)
+                for k, v in metrics.items():
+                    tbx.add_scalar('dev/{}'.format(k), v, global_step)
                 eval_start_time = time.time()
-
                 dev_F1 = metrics['f1']
                 if best_dev_F1 is None or dev_F1 > best_dev_F1:
                     best_dev_F1 = dev_F1
@@ -161,7 +166,7 @@ def train(config):
         if stop_train: break
     logging('best_dev_F1 {}'.format(best_dev_F1))
 
-def evaluate_batch(data_source, model, max_batches, eval_file, config):
+def evaluate_batch(data_source, model, max_batches, eval_file, config, step=0, tbx=None):
     answer_dict = {}
     sp_dict = {}
     total_loss, step_cnt = 0, 0
@@ -186,14 +191,51 @@ def evaluate_batch(data_source, model, max_batches, eval_file, config):
         loss = (nll_sum(predict_type, q_type) + nll_sum(logit1, y1) + nll_sum(logit2, y2)) / context_idxs.size(0) + config.sp_lambda * nll_average(predict_support.view(-1, 2), is_support.view(-1))
         answer_dict_ = convert_tokens(eval_file, data['ids'], yp1.data.cpu().numpy().tolist(), yp2.data.cpu().numpy().tolist(), np.argmax(predict_type.data.cpu().numpy(), 1))
         answer_dict.update(answer_dict_)
-
-        total_loss += loss.data[0]
+        #dictionary of predictions is answer_dict
+        total_loss += loss.data.item()
         step_cnt += 1
     loss = total_loss / step_cnt
-    metrics = evaluate(eval_file, answer_dict)
+    metrics = evaluate(eval_file, answer_dict, step, config, tbx, answer_dict, eval_file, 'val', 10)
     metrics['loss'] = loss
-
     return metrics
+
+
+def visualize(tbx, pred_dict, eval_path, step, split, num_visuals):
+    """Visualize text examples to TensorBoard.
+    Args:
+        tbx (tensorboardX.SummaryWriter): Summary writer.
+        pred_dict (dict): dict of predictions of the form id -> pred.
+        eval_path (str): Path to eval JSON file.
+        step (int): Number of examples seen so far during training.
+        split (str): Name of data split being visualized.
+        num_visuals (int): Number of visuals to select at random from preds.
+    """
+    if num_visuals <= 0:
+        return
+    if num_visuals > len(pred_dict):
+        num_visuals = len(pred_dict)
+
+    visual_ids = np.random.choice(list(pred_dict), size=num_visuals, replace=False)
+
+    with open(eval_path, 'r') as eval_file:
+        eval_dict = json.load(eval_file)
+    for i, id_ in enumerate(visual_ids):
+        pred = pred_dict[id_] or 'N/A'
+        example = eval_dict[str(id_)]
+        question = example['question']
+        context = example['context']
+        answers = example['answer']
+
+        gold = answers[0] if answers else 'N/A'
+        tbl_fmt = ('- **Question:** {}\n'
+                   + '- **Context:** {}\n'
+                   + '- **Answer:** {}\n'
+                   + '- **Prediction:** {}')
+        tbx.add_text(tag='{}/{}_of_{}'.format(split, i + 1, num_visuals),
+                     text_string=tbl_fmt.format(question, context, gold, pred),
+                     global_step=step)
+
+
 
 def predict(data_source, model, eval_file, config, prediction_file):
     answer_dict = {}

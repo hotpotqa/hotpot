@@ -7,6 +7,7 @@ parser = argparse.ArgumentParser()
 
 glove_word_file = "glove.840B.300d.txt"
 
+questions_file = "toy_set.json"
 word_emb_file = "word_emb.json"
 char_emb_file = "char_emb.json"
 train_eval = "train_eval.json"
@@ -26,6 +27,7 @@ parser.add_argument('--data_file', type=str)
 parser.add_argument('--glove_word_file', type=str, default=glove_word_file)
 parser.add_argument('--save', type=str, default='HOTPOT')
 
+parser.add_argument('--questions_file', type=str, default=questions_file)
 parser.add_argument('--word_emb_file', type=str, default=word_emb_file)
 parser.add_argument('--char_emb_file', type=str, default=char_emb_file)
 parser.add_argument('--train_eval_file', type=str, default=train_eval)
@@ -79,6 +81,7 @@ config.test_record_file = _concat(config.test_record_file)
 # config.train_eval_file = _concat(config.train_eval_file)
 config.dev_eval_file = _concat(config.dev_eval_file)
 config.test_eval_file = _concat(config.test_eval_file)
+config.questions_file = _concat(config.questions_file)
 
 if config.mode == 'train':
     train(config)

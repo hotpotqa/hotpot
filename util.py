@@ -9,6 +9,7 @@ from torch.autograd import Variable
 import copy
 import ujson as json
 import traceback
+from tensorboardX import SummaryWriter
 
 IGNORE_INDEX = -100
 
@@ -170,22 +171,60 @@ def convert_tokens(eval_file, qa_id, pp1, pp2, p_type):
             assert False
     return answer_dict
 
-def evaluate(eval_file, answer_dict):
+def evaluate(eval_file, answer_dict, step=0, config=None, tbx=None, pred_dict=None, eval_path=None, split=None, num_visuals=None):
     f1 = exact_match = total = 0
+    ids = []
     for key, value in answer_dict.items():
         total += 1
         ground_truths = eval_file[key]["answer"]
         prediction = value
         assert len(ground_truths) == 1
         cur_EM = exact_match_score(prediction, ground_truths[0])
+        if cur_EM == 0:
+            ids.append(key)
         cur_f1, _, _ = f1_score(prediction, ground_truths[0])
         exact_match += cur_EM
         f1 += cur_f1
-
+    visualize(tbx, config, pred_dict, eval_path, step, split, num_visuals, ids)
     exact_match = 100.0 * exact_match / total
     f1 = 100.0 * f1 / total
 
     return {'exact_match': exact_match, 'f1': f1}
+
+def visualize(tbx, config, pred_dict, eval_path, step, split, num_visuals, ids):
+    if num_visuals <= 0:
+        return
+    if num_visuals > len(pred_dict):
+        num_visuals = len(pred_dict)
+
+    #visual_ids = np.random.choice(list(pred_dict), size=num_visuals, replace=False)
+
+    with open(config.dev_eval_file, 'r') as eval_file:
+        eval_dict = json.load(eval_file)
+    with open(config.questions_file, 'r') as question_file:
+        question_dict = json.load(question_file)
+    for i, id_ in enumerate(ids):
+        pred = pred_dict[id_] or 'N/A'
+        example = eval_dict[str(id_)]
+        #question = example['question']
+        cur_dict = next(item for item in question_dict if item["_id"] == id_)
+        question = cur_dict['question']
+        context = example['context']
+        answers = example['answer']
+
+        gold = answers[0] if answers else 'N/A'
+        tbl_fmt = ('- **Question:** {}\n'
+                   + '- **Context:** {}\n'
+                   + '- **Answer:** {}\n'
+                   + '- **Prediction:** {}')
+        tbx.add_text(tag='{}/{}_of_{}'.format(split, i + 1, num_visuals),
+                     text_string=tbl_fmt.format(question, context, gold, pred),
+                     global_step=step)
+
+
+
+
+
 
 # def evaluate(eval_file, answer_dict, full_stats=False):
 #     if full_stats:
