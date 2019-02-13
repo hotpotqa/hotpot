@@ -208,40 +208,40 @@ def evaluate_batch(data_source, model, max_batches, eval_file, config, step=0, t
     return metrics
 
 
-def visualize(tbx, pred_dict, eval_path, step, split, num_visuals):
-    """Visualize text examples to TensorBoard.
-    Args:
-        tbx (tensorboardX.SummaryWriter): Summary writer.
-        pred_dict (dict): dict of predictions of the form id -> pred.
-        eval_path (str): Path to eval JSON file.
-        step (int): Number of examples seen so far during training.
-        split (str): Name of data split being visualized.
-        num_visuals (int): Number of visuals to select at random from preds.
-    """
-    if num_visuals <= 0:
-        return
-    if num_visuals > len(pred_dict):
-        num_visuals = len(pred_dict)
-
-    visual_ids = np.random.choice(list(pred_dict), size=num_visuals, replace=False)
-
-    with open(eval_path, 'r') as eval_file:
-        eval_dict = json.load(eval_file)
-    for i, id_ in enumerate(visual_ids):
-        pred = pred_dict[id_] or 'N/A'
-        example = eval_dict[str(id_)]
-        question = example['question']
-        context = example['context']
-        answers = example['answer']
-
-        gold = answers[0] if answers else 'N/A'
-        tbl_fmt = ('- **Question:** {}\n'
-                   + '- **Context:** {}\n'
-                   + '- **Answer:** {}\n'
-                   + '- **Prediction:** {}')
-        tbx.add_text(tag='{}/{}_of_{}'.format(split, i + 1, num_visuals),
-                     text_string=tbl_fmt.format(question, context, gold, pred),
-                     global_step=step)
+# def visualize(tbx, pred_dict, eval_path, step, split, num_visuals):
+#     """Visualize text examples to TensorBoard.
+#     Args:
+#         tbx (tensorboardX.SummaryWriter): Summary writer.
+#         pred_dict (dict): dict of predictions of the form id -> pred.
+#         eval_path (str): Path to eval JSON file.
+#         step (int): Number of examples seen so far during training.
+#         split (str): Name of data split being visualized.
+#         num_visuals (int): Number of visuals to select at random from preds.
+#     """
+#     if num_visuals <= 0:
+#         return
+#     if num_visuals > len(pred_dict):
+#         num_visuals = len(pred_dict)
+#
+#     visual_ids = np.random.choice(list(pred_dict), size=num_visuals, replace=False)
+#
+#     with open(eval_path, 'r') as eval_file:
+#         eval_dict = json.load(eval_file)
+#     for i, id_ in enumerate(visual_ids):
+#         pred = pred_dict[id_] or 'N/A'
+#         example = eval_dict[str(id_)]
+#         question = example['question']
+#         context = example['context']
+#         answers = example['answer']
+#
+#         gold = answers[0] if answers else 'N/A'
+#         tbl_fmt = ('- **Question:** {}\n'
+#                    + '- **Context:** {}\n'
+#                    + '- **Answer:** {}\n'
+#                    + '- **Prediction:** {}')
+#         tbx.add_text(tag='{}/{}_of_{}'.format(split, i + 1, num_visuals),
+#                      text_string=tbl_fmt.format(question, context, gold, pred),
+#                      global_step=step)
 
 
 

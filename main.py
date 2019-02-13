@@ -7,7 +7,7 @@ parser = argparse.ArgumentParser()
 
 glove_word_file = "glove.840B.300d.txt"
 
-questions_file = "toy_train.json"
+questions_file = "toy_dev.json"
 word_emb_file = "word_emb.json"
 char_emb_file = "char_emb.json"
 train_eval = "train_eval.json"
