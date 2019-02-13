@@ -96,7 +96,7 @@ def train(config):
     eval_start_time = time.time()
     model.train()
 
-    for epoch in range(10000):
+    for epoch in range(200):####
         for data in build_train_iterator():
             context_idxs = Variable(data['context_idxs'])
             ques_idxs = Variable(data['ques_idxs'])
@@ -153,7 +153,7 @@ def train(config):
                 for k, v in metrics.items():
                     tbx.add_scalar('dev/{}'.format(k), v, global_step)
                 eval_start_time = time.time()
-                
+
                 dev_F1 = metrics['f1']
                 if best_dev_F1 is None or dev_F1 > best_dev_F1:
                     best_dev_F1 = dev_F1
