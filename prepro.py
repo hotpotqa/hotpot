@@ -259,10 +259,10 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, char2id
 
         total += 1
 
-        context_idxs = torch.LongTensor(para_limit).zero_()
-        context_char_idxs = torch.LongTensor(para_limit, char_limit).zero_()
-        ques_idxs = torch.LongTensor(ques_limit).zero_()
-        ques_char_idxs = torch.LongTensor(ques_limit, char_limit).zero_()
+        context_idxs = np.zeros(para_limit, dtype=np.int64)
+        context_char_idxs = np.zeros((para_limit, char_limit), dtype=np.int64)
+        ques_idxs = np.zeros(ques_limit, dtype=np.int64)
+        ques_char_idxs = np.zeros((ques_limit, char_limit), dtype=np.int64)
 
         def _get_word(word):
             for each in (word, word.lower(), word.capitalize(), word.upper()):
@@ -275,31 +275,24 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, char2id
                 return char2idx_dict[char]
             return 1
 
-        for i, token in enumerate(example["context_tokens"]):
-            context_idxs[i] = _get_word(token)
-
-        for i, token in enumerate(example["ques_tokens"]):
-            ques_idxs[i] = _get_word(token)
+        context_idxs[:len(example['context_tokens'])] = [_get_word(token) for token in example['context_tokens']]
+        ques_idxs[:len(example['ques_tokens'])] = [_get_word(token) for token in example['ques_tokens']]
 
         for i, token in enumerate(example["context_chars"]):
-            for j, char in enumerate(token):
-                if j == char_limit:
-                    break
-                context_char_idxs[i, j] = _get_char(char)
+            l = min(len(token), char_limit)
+            context_char_idxs[i, :l] = [_get_char(char) for char in token[:l]]
 
         for i, token in enumerate(example["ques_chars"]):
-            for j, char in enumerate(token):
-                if j == char_limit:
-                    break
-                ques_char_idxs[i, j] = _get_char(char)
+            l = min(len(token), char_limit)
+            ques_char_idxs[i, :l] = [_get_char(char) for char in token[:l]]
 
         start, end = example["y1s"][-1], example["y2s"][-1]
         y1, y2 = start, end
 
-        datapoints.append({'context_idxs': context_idxs,
-            'context_char_idxs': context_char_idxs,
-            'ques_idxs': ques_idxs,
-            'ques_char_idxs': ques_char_idxs,
+        datapoints.append({'context_idxs': torch.from_numpy(context_idxs),
+            'context_char_idxs': torch.from_numpy(context_char_idxs),
+            'ques_idxs': torch.from_numpy(ques_idxs),
+            'ques_char_idxs': torch.from_numpy(ques_char_idxs),
             'y1': y1,
             'y2': y2,
             'id': example['id'],
