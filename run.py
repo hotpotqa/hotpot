@@ -96,7 +96,7 @@ def train(config):
     eval_start_time = time.time()
     model.train()
 
-    for epoch in range(200):####
+    for epoch in range(100):####
         for data in build_train_iterator():
             context_idxs = Variable(data['context_idxs'])
             ques_idxs = Variable(data['ques_idxs'])
