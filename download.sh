@@ -1,4 +1,4 @@
-or file_name in hotpot_dev_distractor_v1 hotpot_dev_fullwiki_v1 hotpot_train_v1.1
+for file_name in hotpot_dev_distractor_v1 hotpot_dev_fullwiki_v1 hotpot_train_v1.1
 do
     json_name="$file_name.json"
     tmp_name="$file_name.tmp"
