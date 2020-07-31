@@ -7,7 +7,6 @@ import numpy as np
 import os.path
 import argparse
 import torch
-# import pickle
 import torch
 import os
 from joblib import Parallel, delayed
@@ -81,7 +80,6 @@ def convert_idx(text, tokens):
 
 def prepro_sent(sent):
     return sent
-    # return sent.replace("''", '" ').replace("``", '" ')
 
 def _process_article(article, config):
     paragraphs = article['context']
@@ -298,8 +296,20 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, char2id
             'id': example['id'],
             'start_end_facts': example['start_end_facts']})
     print("Build {} / {} instances of features in total".format(total, total_))
-    # pickle.dump(datapoints, open(out_file, 'wb'), protocol=-1)
-    torch.save(datapoints, out_file)
+    dir_name = data_type
+    try:
+        os.mkdir(dir_name)
+        print(f"Directory {dir_name} created")
+    except OSError:
+        print(f"Directory {dir_name} already exists, writing files there")
+    fileparts = out_file.split('.')
+    name, ext = '.'.join(fileparts[:-1]), fileparts[-1] #separating file into name and extention
+    num_objects = len(datapoints)
+    num_files = config.num_files if num_files > 0 else num_objects
+    batch_size = num_objects // num_files
+    for i in range(num_files - 1):
+        torch.save(datapoints[i * batch_size : (i + 1) * batch_size], f'{dir_name}/{name}_{str(i)}.{ext}')
+    torch.save(datapoints[(num_files - 1) * batch_size : ], f'{dir_name}/{name}_{str(num_files - 1)}.{ext}')
 
 def save(filename, obj, message=None):
     if message is not None:

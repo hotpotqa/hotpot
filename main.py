@@ -67,16 +67,16 @@ parser.add_argument('--fullwiki', action='store_true')
 parser.add_argument('--prediction_file', type=str)
 parser.add_argument('--sp_threshold', type=float, default=0.3)
 
+parser.add_argument('--num_files', type=int, default=1)
+
 config = parser.parse_args()
 
 def _concat(filename):
     if config.fullwiki:
         return 'fullwiki.{}'.format(filename)
     return filename
-# config.train_record_file = _concat(config.train_record_file)
 config.dev_record_file = _concat(config.dev_record_file)
 config.test_record_file = _concat(config.test_record_file)
-# config.train_eval_file = _concat(config.train_eval_file)
 config.dev_eval_file = _concat(config.dev_eval_file)
 config.test_eval_file = _concat(config.test_eval_file)
 
