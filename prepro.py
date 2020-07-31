@@ -305,7 +305,7 @@ def build_features(config, examples, data_type, out_file, word2idx_dict, char2id
     fileparts = out_file.split('.')
     name, ext = '.'.join(fileparts[:-1]), fileparts[-1] #separating file into name and extention
     num_objects = len(datapoints)
-    num_files = config.num_files if num_files > 0 else num_objects
+    num_files = config.num_files if config.num_files > 0 else num_objects
     batch_size = num_objects // num_files
     for i in range(num_files - 1):
         torch.save(datapoints[i * batch_size : (i + 1) * batch_size], f'{dir_name}/{name}_{str(i)}.{ext}')
