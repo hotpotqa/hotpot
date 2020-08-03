@@ -1,5 +1,6 @@
 import os
 from prepro import prepro
+from bert_prepro import prepro as BERT_prepro
 from run import train, test
 import argparse
 
@@ -68,6 +69,8 @@ parser.add_argument('--prediction_file', type=str)
 parser.add_argument('--sp_threshold', type=float, default=0.3)
 
 parser.add_argument('--num_files', type=int, default=1)
+parser.add_argument('--tokenizer', type=str, default='spacy')
+
 
 config = parser.parse_args()
 
@@ -83,7 +86,10 @@ config.test_eval_file = _concat(config.test_eval_file)
 if config.mode == 'train':
     train(config)
 elif config.mode == 'prepro':
-    prepro(config)
+    if config.tokenizer == 'spacy':
+        prepro(config)
+    else:
+        BERT_prepro(config)
 elif config.mode == 'test':
     test(config)
 elif config.mode == 'count':
