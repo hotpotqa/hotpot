@@ -182,16 +182,7 @@ def process_file(filename, config):
 
 def build_features(config, examples, data_type, out_file):
     if data_type == 'test':
-        para_limit, ques_limit = 0, 0
-        for example in tqdm(examples):
-            para_limit = max(para_limit, len(example['context_tokens']))
-            ques_limit = max(ques_limit, len(example['ques_tokens']))
-    else:
-        para_limit = config.para_limit
-        ques_limit = config.ques_limit
-
-    def filter_func(example):
-        return len(example["context_tokens"]) > para_limit or len(example["question_tokens"]) > ques_limit
+        BERT_MAX_SEQ_LEN = 100000
 
     print("Processing {} examples...".format(data_type))
     datapoints = []
@@ -201,21 +192,6 @@ def build_features(config, examples, data_type, out_file):
     for example in tqdm(examples):
         total_ += 1
         
-        '''
-        if len(example["context_tokens"]) > para_limit:
-            if example["y2s"] > para_limit:
-                context_filtered += 1
-                continue
-       
-        example["context_tokens"] = example["context_tokens"][: para_limit]
-        
-        if len(example["question_tokens"]) > ques_limit:
-            question_filtered += 1
-            continue
-
-
-        total += 1
-        '''
         question_shift = len(example['question_tokens']) + 2  # cls + question + sep
         # answer span is based on context_text tokens only but after encoding
         #  question and special tokens are added in front
@@ -231,10 +207,9 @@ def build_features(config, examples, data_type, out_file):
 
         datapoints.append(
             {'input_ids': input_ids, 'attention_mask': attention_mask, 'token_type_ids' : token_type_ids,
-            'y1': y1, 'y2': y2, 'id': example['id']}
+                'y1': y1, 'y2': y2, 'id': example['id'], 'question_tokens' : question_tokens}
         )
-    print("Build {} / {} instances of features in total".format(total, total_))
-    print("Filtered {} items because of context / {} items because of question".format(context_filtered, question_filtered))
+    print("Filtered {} / {} instances of features in total".format(total, total_))
     dir_name = data_type
     try:
         os.mkdir(dir_name)
