@@ -16,6 +16,7 @@ import bisect
 import re
 from transformers import BertTokenizer
 
+BERT_MAX_SEQ_LEN = 512
 tokenizer = BertTokenizer.from_pretrained('bert-large-cased', return_token_type_ids=True)
 
 
@@ -101,9 +102,8 @@ def encode(question, context, config):
     :return: BERT-like tokenization (with special tokens: [CLS] question [SEP] context [SEP])
     """
     encoding = tokenizer.encode_plus(question, context, padding='max_length',
-                                     max_length=config.para_limit + config.ques_limit + 3,  is_pretokenized=True)  # cls + 2 * sep
-    return encoding["input_ids"], encoding["attention_mask"]
-
+                                     max_length=BERT_MAX_SEQ_LEN,  truncation='only_second')  # cls + 2 * sep
+    return encoding["input_ids"], encoding["attention_mask"], encoding["token_type_ids"]
 
 
 def _process_article(article, config):
@@ -142,20 +142,20 @@ def _process_article(article, config):
     if 'answer' in article:
         answer = article['answer'].strip()
         if answer.lower() == 'yes':
-            best_indices = [-1, -1]
+            best_indices = [-3, -3]
         elif answer.lower() == 'no':
             best_indices = [-2, -2]
         else:
             if answer not in text_context:
                 # in the fullwiki setting, the answer might not have been retrieved
                 # use (0, 1) so that we can proceed
-                best_indices = (1, 0)
+                best_indices = [-1, -1]
             else:
                 best_indices, _ = fix_span(text_context, flat_offsets, article['answer'])
     else:
         # some random stuff
         answer = 'random'
-        best_indices = (1, 0)
+        best_indices = [-1, -1]
     example = {'context' : text_context, 'question' : article['question'],
                'context_tokens': context_tokens, 'question_tokens': tokenize(article['question']),
                'y1s': best_indices[0], 'y2s': best_indices[1] + 1, 'id': article['_id']}
@@ -197,15 +197,25 @@ def build_features(config, examples, data_type, out_file):
     datapoints = []
     total = 0
     total_ = 0
+    context_filtered, question_filtered = 0, 0
     for example in tqdm(examples):
         total_ += 1
-
-        if filter_func(example):
+        
+        '''
+        if len(example["context_tokens"]) > para_limit:
+            if example["y2s"] > para_limit:
+                context_filtered += 1
+                continue
+       
+        example["context_tokens"] = example["context_tokens"][: para_limit]
+        
+        if len(example["question_tokens"]) > ques_limit:
+            question_filtered += 1
             continue
 
-        total += 1
 
-        input_ids, attention_mask = encode(example['question'], example['context'], config)
+        total += 1
+        '''
         question_shift = len(example['question_tokens']) + 2  # cls + question + sep
         # answer span is based on context_text tokens only but after encoding
         #  question and special tokens are added in front
@@ -213,11 +223,18 @@ def build_features(config, examples, data_type, out_file):
         start, end = example["y1s"], example["y2s"]
         y1, y2 = start + question_shift, end + question_shift
 
+        if y2 > BERT_MAX_SEQ_LEN - 1: # sep
+            total += 1
+            continue
+
+        input_ids, attention_mask, token_type_ids = encode(example['question'], example['context'], config)
+
         datapoints.append(
-            {'input_ids': input_ids, 'attention_mask': attention_mask,
+            {'input_ids': input_ids, 'attention_mask': attention_mask, 'token_type_ids' : token_type_ids,
             'y1': y1, 'y2': y2, 'id': example['id']}
         )
     print("Build {} / {} instances of features in total".format(total, total_))
+    print("Filtered {} items because of context / {} items because of question".format(context_filtered, question_filtered))
     dir_name = data_type
     try:
         os.mkdir(dir_name)
