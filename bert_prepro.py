@@ -95,14 +95,14 @@ def filter(token):
     return token.lstrip(symbols)
 
 
-def encode(question, context, config):
+def encode(question, context, max_length, config):
     """
     :param question: (str) question in nl
     :param context: (str) the whole context concatenated
     :return: BERT-like tokenization (with special tokens: [CLS] question [SEP] context [SEP])
     """
     encoding = tokenizer.encode_plus(question, context, padding='max_length',
-                                     max_length=BERT_MAX_SEQ_LEN,  truncation='only_second')  # cls + 2 * sep
+                                     max_length=max_length,  truncation='only_second')
     return encoding["input_ids"], encoding["attention_mask"], encoding["token_type_ids"]
 
 
@@ -149,16 +149,19 @@ def _process_article(article, config):
             if answer not in text_context:
                 # in the fullwiki setting, the answer might not have been retrieved
                 # use (0, 1) so that we can proceed
+                answer = ''
                 best_indices = [-1, -1]
             else:
                 best_indices, _ = fix_span(text_context, flat_offsets, article['answer'])
     else:
         # some random stuff
-        answer = 'random'
+        answer = ''
         best_indices = [-1, -1]
+
+    answer_tokens = tokenizer.encode_plus(answer, padding='max_length',max_length=BERT_MAX_SEQ_LEN // 2,  truncation=True)['input_ids']
     example = {'context' : text_context, 'question' : article['question'],
-               'context_tokens': context_tokens, 'question_tokens': tokenize(article['question']),
-               'y1s': best_indices[0], 'y2s': best_indices[1] + 1, 'id': article['_id']}
+               'answer_tokens': answer_tokens, 'question_tokens': tokenize(article['question']),
+               'y1s': best_indices[0], 'y2s': best_indices[1], 'id': article['_id']}
     eval_example = {'context': text_context, 'spans': flat_offsets, 'answer': [answer], 'id': article['_id']}
     return example, eval_example
 
@@ -182,16 +185,18 @@ def process_file(filename, config):
 
 def build_features(config, examples, data_type, out_file):
     if data_type == 'test':
-        BERT_MAX_SEQ_LEN = 100000
-
+        max_seq_len = 100000
+    else:
+        max_seq_len = BERT_MAX_SEQ_LEN
     print("Processing {} examples...".format(data_type))
     datapoints = []
     total = 0
     total_ = 0
+    avg_q_len = 0
+    avg_c_len = 0
     context_filtered, question_filtered = 0, 0
     for example in tqdm(examples):
         total_ += 1
-        
         question_shift = len(example['question_tokens']) + 2  # cls + question + sep
         # answer span is based on context_text tokens only but after encoding
         #  question and special tokens are added in front
@@ -203,13 +208,17 @@ def build_features(config, examples, data_type, out_file):
             total += 1
             continue
 
-        input_ids, attention_mask, token_type_ids = encode(example['question'], example['context'], config)
+        input_ids, attention_mask, token_type_ids = encode(example['question'], example['context'], max_seq_len, config)
 
         datapoints.append(
             {'input_ids': input_ids, 'attention_mask': attention_mask, 'token_type_ids' : token_type_ids,
-                'y1': y1, 'y2': y2, 'id': example['id'], 'question_tokens' : question_tokens}
+                'y1': y1, 'y2': y2, 'id': example['id'], 'answer_tokens' : example['answer_tokens']}
         )
+        
+    #print("Avg question length  {}".format(avg_q_len / total_))
+    #print("Avg context length  {}".format(avg_c_len / total_))
     print("Filtered {} / {} instances of features in total".format(total, total_))
+
     dir_name = data_type
     try:
         os.mkdir(dir_name)
@@ -224,7 +233,7 @@ def build_features(config, examples, data_type, out_file):
     for i in range(num_files - 1):
         torch.save(datapoints[i * batch_size: (i + 1) * batch_size], f'{dir_name}/{name}_{str(i)}.{ext}')
     torch.save(datapoints[(num_files - 1) * batch_size:], f'{dir_name}/{name}_{str(num_files - 1)}.{ext}')
-
+    
 
 def save(filename, obj, message=None):
     if message is not None:
