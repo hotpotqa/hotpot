@@ -17,9 +17,9 @@ word2idx_file = "word2idx.json"
 char2idx_file = "char2idx.json"
 idx2word_file = 'idx2word.json'
 idx2char_file = 'idx2char.json'
-train_record_file = 'train_record.pkl'
-dev_record_file = 'dev_record.pkl'
-test_record_file = 'test_record.pkl'
+train_record_file = 'train_record.jsonl'
+dev_record_file = 'dev_record.jsonl'
+test_record_file = 'test_record.jsonl'
 
 
 parser.add_argument('--mode', type=str, default='train')
@@ -70,7 +70,10 @@ parser.add_argument('--sp_threshold', type=float, default=0.3)
 
 parser.add_argument('--num_files', type=int, default=1)
 parser.add_argument('--tokenizer', type=str, default='spacy')
-
+parser.add_argument('--doc_stride', type=int, default=128)
+parser.add_argument('--is_training', type=bool, default=True)
+parser.add_argument('--max_query_length', type=int, default=75)
+parser.add_argument('--max_seq_length', type=int, default=512)
 
 config = parser.parse_args()
 

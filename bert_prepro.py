@@ -2,6 +2,8 @@ import random
 from tqdm import tqdm
 import spacy
 import ujson as json
+import jsonlines
+import collections
 from collections import Counter
 import numpy as np
 import os.path
@@ -14,6 +16,8 @@ from util import normalize_answer
 import torch
 import bisect
 import re
+import string
+import copy
 from transformers import BertTokenizer
 
 BERT_MAX_SEQ_LEN = 512
@@ -95,6 +99,16 @@ def filter(token):
     return token.lstrip(symbols)
 
 
+def remove_punctuation(sent):
+    """
+    :param sent: (str) possibly with punctuation
+    :return: (str) definitely without punctuation
+    """
+    return re.sub('[%s]' % re.escape(string.punctuation), '', sent)
+
+def preprocess(sent):
+    return sent
+
 def encode(question, context, max_length, config):
     """
     :param question: (str) question in nl
@@ -123,6 +137,7 @@ def _process_article(article, config):
     flat_offsets = []
 
     def _process(sent):
+        sent = preprocess(sent)
         sent = " " + sent + " "
         nonlocal text_context, context_tokens, flat_offsets
         N_chars = len(text_context)
@@ -140,9 +155,9 @@ def _process_article(article, config):
         for sent in cur_para:
             _process(sent)
     if 'answer' in article:
-        answer = article['answer'].strip()
+        answer = preprocess(article['answer'].strip())
         if answer.lower() == 'yes':
-            best_indices = [-3, -3]
+            best_indices = [-1, -1]
         elif answer.lower() == 'no':
             best_indices = [-2, -2]
         else:
@@ -150,19 +165,20 @@ def _process_article(article, config):
                 # in the fullwiki setting, the answer might not have been retrieved
                 # use (0, 1) so that we can proceed
                 answer = ''
-                best_indices = [-1, -1]
+                best_indices = [0, 0]
             else:
-                best_indices, _ = fix_span(text_context, flat_offsets, article['answer'])
+                best_indices, _ = fix_span(text_context, flat_offsets, answer)
     else:
         # some random stuff
         answer = ''
-        best_indices = [-1, -1]
+        best_indices = [0, 0]
 
-    answer_tokens = tokenizer.encode_plus(answer, padding='max_length',max_length=BERT_MAX_SEQ_LEN // 2,  truncation=True)['input_ids']
-    example = {'context' : text_context, 'question' : article['question'],
-               'answer_tokens': answer_tokens, 'question_tokens': tokenize(article['question']),
+    answer_tokens = tokenizer.encode_plus(answer, padding='max_length', max_length=BERT_MAX_SEQ_LEN // 2,  truncation=True)['input_ids']
+    question_tokens = tokenize(preprocess(article['question']))
+
+    example = {'question_tokens': question_tokens, 'context_tokens': context_tokens,
                'y1s': best_indices[0], 'y2s': best_indices[1], 'id': article['_id']}
-    eval_example = {'context': text_context, 'spans': flat_offsets, 'answer': [answer], 'id': article['_id']}
+    eval_example = {'context': text_context, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
     return example, eval_example
 
 
@@ -173,14 +189,48 @@ def process_file(filename, config):
 
     outputs = Parallel(n_jobs=12, verbose=10)(delayed(_process_article)(article, config) for article in data)
     examples = [e[0] for e in outputs]
-    for _, e in outputs:
-        if e is not None:
-            eval_examples[e['id']] = e
-
+    eval_examples = [e[1] for e in outputs]
     random.shuffle(examples)
     print("{} questions in total".format(len(examples)))
 
     return examples, eval_examples
+
+
+def _check_is_max_context(doc_spans, cur_span_index, position):
+    """Check if this is the 'max context' doc span for the token."""
+    # Because of the sliding window approach taken to scoring documents, a single
+    # token can appear in multiple documents. E.g.
+    #  Doc: the man went to the store and bought a gallon of milk
+    #  Span A: the man went to the
+    #  Span B: to the store and bought
+    #  Span C: and bought a gallon of
+    #  ...
+    #
+    # Now the word 'bought' will have two scores from spans B and C. We only
+    # want to consider the score with "maximum context", which we define as
+    # the *minimum* of its left and right context (the *sum* of left and
+    # right context will always be the same, of course).
+    #
+    # In the example the maximum context for 'bought' would be span C since
+    # it has 1 left context and 3 right context, while span B has 4 left context
+    # and 0 right context.
+
+    best_score = None
+    best_span_index = None
+    for (span_index, doc_span) in enumerate(doc_spans):
+        end = doc_span.start + doc_span.length - 1
+        if position < doc_span.start:
+            continue
+        if position > end:
+            continue
+        num_left_context = position - doc_span.start
+        num_right_context = end - position
+        score = min(num_left_context, num_right_context) + 0.01 * doc_span.length
+        if best_score is None or score > best_score:
+            best_score = score
+            best_span_index = span_index
+
+    return cur_span_index == best_span_index
 
 
 def build_features(config, examples, data_type, out_file):
@@ -190,34 +240,99 @@ def build_features(config, examples, data_type, out_file):
         max_seq_len = BERT_MAX_SEQ_LEN
     print("Processing {} examples...".format(data_type))
     datapoints = []
-    total = 0
-    total_ = 0
-    avg_q_len = 0
-    avg_c_len = 0
-    context_filtered, question_filtered = 0, 0
+    doc_stride = config.doc_stride
+    
+    unique_id = 0
     for example in tqdm(examples):
-        total_ += 1
-        question_shift = len(example['question_tokens']) + 2  # cls + question + sep
+        question_tokens = example['question_tokens']
+        context_tokens = example['context_tokens']
+        if len(question_tokens) > config.max_query_length:
+            question_tokens = question_tokens[0 : config.max_query_length]
+        question_shift = len(question_tokens) + 2  # [CLS] + question + [SEP]
         # answer span is based on context_text tokens only but after encoding
         #  question and special tokens are added in front
 
-        start, end = example["y1s"], example["y2s"]
-        y1, y2 = start + question_shift, end + question_shift
+        # The -3 accounts for [CLS], [SEP] and [SEP]
+        max_tokens_for_seq = config.max_seq_length - len(question_tokens) - 3
 
-        if y2 > BERT_MAX_SEQ_LEN - 1: # sep
-            total += 1
-            continue
+        if config.is_training:
+            start, end = example["y1s"], example["y2s"]
 
-        input_ids, attention_mask, token_type_ids = encode(example['question'], example['context'], max_seq_len, config)
+        _DocSpan = collections.namedtuple(
+            "DocSpan", ["start", "length"])
+        doc_spans = []
+        start_offset = 0
 
-        datapoints.append(
-            {'input_ids': input_ids, 'attention_mask': attention_mask, 'token_type_ids' : token_type_ids,
-                'y1': y1, 'y2': y2, 'id': example['id'], 'answer_tokens' : example['answer_tokens']}
-        )
-        
-    #print("Avg question length  {}".format(avg_q_len / total_))
-    #print("Avg context length  {}".format(avg_c_len / total_))
-    print("Filtered {} / {} instances of features in total".format(total, total_))
+        while start_offset < len(context_tokens):
+            length = len(context_tokens) - start_offset
+            if length > max_tokens_for_seq:
+                length = max_tokens_for_seq
+            doc_spans.append(_DocSpan(start=start_offset, length=length))
+            if start_offset + length == len(context_tokens):
+                break
+            start_offset += min(length, doc_stride)
+
+        for (doc_span_index, doc_span) in enumerate(doc_spans):
+            tokens = []
+            segment_ids = []
+            max_context = []
+
+            tokens.append("[CLS]")
+            segment_ids.append(0)
+            max_context.append(0)
+
+            tokens.extend(question_tokens)
+            segment_ids.extend([0] * len(question_tokens))
+            max_context.extend([0] * len(question_tokens))
+
+            tokens.append("[SEP]")
+            segment_ids.append(0)
+            max_context.append(0)
+
+            for i in range(doc_span.length):
+                split_token_index = doc_span.start + i
+
+                max_context.append(int(_check_is_max_context(doc_spans, doc_span_index,
+                                                       split_token_index)))
+                tokens.append(context_tokens[split_token_index])
+                segment_ids.append(1)
+            tokens.append("[SEP]")
+            segment_ids.append(1)
+            max_context.append(0)
+
+            input_ids = tokenizer.convert_tokens_to_ids(tokens)
+            input_mask = [1] * len(input_ids)
+
+            pad_len = max_seq_len - len(input_ids)
+            pad = [0] * pad_len
+
+            input_ids.extend(pad)
+            input_mask.extend(pad)
+            segment_ids.extend(pad)
+            max_context.extend(pad)
+
+            assert len(input_ids) == config.max_seq_length
+            assert len(input_mask) == config.max_seq_length
+            assert len(segment_ids) == config.max_seq_length
+            assert len(max_context) == config.max_seq_length
+
+            doc_start = doc_span.start
+            doc_end = doc_span.start + doc_span.length - 1
+
+            y1, y2 = None, None
+            if config.is_training:
+                if not (start >= doc_start and end <= doc_end):
+                    y1 = 0
+                    y2 = 0
+                else:
+                    y1 = start - doc_start + question_shift
+                    y2 = end - doc_start + question_shift
+
+            datapoints.append({'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
+                               'max_context': max_context,
+                               'y1': y1, 'y2': y2, 'example_id': example['id'], 'feature_id' : unique_id})
+            unique_id += 1
+
 
     dir_name = data_type
     try:
@@ -225,15 +340,19 @@ def build_features(config, examples, data_type, out_file):
         print(f"Directory {dir_name} created")
     except OSError:
         print(f"Directory {dir_name} already exists, writing files there")
+
     fileparts = out_file.split('.')
-    name, ext = '.'.join(fileparts[:-1]), fileparts[-1]  # separating file into name and extention
+    name, ext = '.'.join(fileparts[:-1]), fileparts[-1]
     num_objects = len(datapoints)
     num_files = config.num_files if config.num_files > 0 else num_objects
     batch_size = num_objects // num_files
     for i in range(num_files - 1):
-        torch.save(datapoints[i * batch_size: (i + 1) * batch_size], f'{dir_name}/{name}_{str(i)}.{ext}')
-    torch.save(datapoints[(num_files - 1) * batch_size:], f'{dir_name}/{name}_{str(num_files - 1)}.{ext}')
-    
+        with jsonlines.open(f'{dir_name}/{name}_{str(i)}.{ext}', mode='w') as writer:
+            for datapoint in datapoints[i * batch_size: (i + 1) * batch_size]:
+                writer.write(datapoint)
+    with jsonlines.open(f'{dir_name}/{name}_{str(num_files - 1)}.{ext}', mode='w') as writer:
+        for datapoint in datapoints[(num_files - 1) * batch_size:]:
+            writer.write(datapoint)
 
 def save(filename, obj, message=None):
     if message is not None:
@@ -257,5 +376,6 @@ def prepro(config):
         eval_file = config.test_eval_file
 
     build_features(config, examples, config.data_split, record_file)
-    save(eval_file, eval_examples, message='{} eval'.format(config.data_split))
+    if config.data_split in ['dev', 'test']:
+        save(eval_file, eval_examples, message='{} eval'.format(config.data_split))
 
