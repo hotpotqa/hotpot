@@ -135,49 +135,73 @@ def _process_article(article, config):
 
     text_context, context_tokens = '', []
     flat_offsets = []
+    start_end_facts = []  # (start_token_id, end_token_id, is_sup_fact=True/False)
+    N_tokens = 0
 
-    def _process(sent):
+    def _process(sent, is_sup_fact=False):
         sent = preprocess(sent)
         sent = " " + sent + " "
-        nonlocal text_context, context_tokens, flat_offsets
+        nonlocal text_context, context_tokens, flat_offsets, start_end_facts, N_tokens
         N_chars = len(text_context)
         sent_tokens = tokenize(sent)
         sent_spans = convert_idx(sent, sent_tokens, filter)
-
         sent_spans = [[N_chars+e[0], N_chars+e[1]] for e in sent_spans]
         text_context += sent
         context_tokens.extend(sent_tokens)
         flat_offsets.extend(sent_spans)
+        sent_N_tokens = len(sent_tokens)
+        start_end_facts.append((N_tokens, N_tokens + sent_N_tokens, is_sup_fact))
+        N_tokens += sent_N_tokens
+
+    if 'supporting_facts' in article:
+        sp_set = set(list(map(tuple, article['supporting_facts'])))
+    else:
+        sp_set = set()
+
+    sp_fact_cnt = 0
 
     for para in paragraphs:
         cur_title, cur_para = para[0], para[1]
         _process(cur_title)
-        for sent in cur_para:
-            _process(sent)
+        for sent_id, sent in enumerate(cur_para):
+            is_sup_fact = (cur_title, sent_id) in sp_set
+            sp_fact_cnt += is_sup_fact
+            _process(sent, is_sup_fact)
+
+    is_answerable = True
+    is_yes_no = False
+    yes_no = None  # 0 if 'no', 1 otherwise
     if 'answer' in article:
         answer = preprocess(article['answer'].strip())
         if answer.lower() == 'yes':
-            best_indices = [-1, -1]
-        elif answer.lower() == 'no':
             best_indices = [-2, -2]
+            is_yes_no = True
+            yes_no = 1
+        elif answer.lower() == 'no':
+            best_indices = [-1, -1]
+            is_yes_no = True
+            yes_no = 1
         else:
             if answer not in text_context:
                 # in the fullwiki setting, the answer might not have been retrieved
                 # use (0, 1) so that we can proceed
                 answer = ''
                 best_indices = [0, 0]
+                is_answerable = False
             else:
                 best_indices, _ = fix_span(text_context, flat_offsets, answer)
     else:
         # some random stuff
         answer = ''
         best_indices = [0, 0]
+        is_answerable = False
 
     answer_tokens = tokenizer.encode_plus(answer, padding='max_length', max_length=BERT_MAX_SEQ_LEN // 2,  truncation=True)['input_ids']
     question_tokens = tokenize(preprocess(article['question']))
 
     example = {'question_tokens': question_tokens, 'context_tokens': context_tokens,
-               'y1s': best_indices[0], 'y2s': best_indices[1], 'id': article['_id']}
+               'y1s': best_indices[0], 'y2s': best_indices[1], 'id': article['_id'],
+               'start_end_facts': start_end_facts, 'is_answerable': is_answerable, 'is_yes_no': is_yes_no, 'yes_no': yes_no}
     eval_example = {'context': text_context, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
     return example, eval_example
 
@@ -272,6 +296,10 @@ def build_features(config, examples, data_type, out_file):
                 break
             start_offset += min(length, doc_stride)
 
+        is_answerable_example = example['is_answerable']
+        is_yes_no_example = example['is_yes_no']
+        yes_no_example = example['yes_no']
+        supportive_facts = example['start_end_facts']
         for (doc_span_index, doc_span) in enumerate(doc_spans):
             tokens = []
             segment_ids = []
@@ -320,19 +348,34 @@ def build_features(config, examples, data_type, out_file):
             doc_end = doc_span.start + doc_span.length - 1
 
             y1, y2 = None, None
+            is_answerable = 0
+            # yes -- 1, no -- 0
+            is_yes_no = 0
+            yes_no = 0
+            answer_options = [1, 0]
             if config.is_training:
-                if not (start >= doc_start and end <= doc_end):
-                    y1 = 0
-                    y2 = 0
-                else:
+                if not is_answerable_example or \
+                        (is_answerable_example and not is_yes_no_example and not (start >= doc_start and end <= doc_end)):
+                    y1, y2 = 0, 0
+                elif is_answerable_example and (start >= doc_start and end <= doc_end):
                     y1 = start - doc_start + question_shift
                     y2 = end - doc_start + question_shift
-
+                    is_answerable = 1
+                elif is_yes_no:
+                    for s, e, sup in supportive_facts:
+                        if sup and (s >= doc_start and e <= doc_end):
+                            is_answerable = 1
+                            is_yes_no = 1
+                            yes_no = answer_options[start]
+                            y1, y2 = start, end
+                            break
+                    else:
+                        y1, y2 = 0, 0
             datapoints.append({'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
                                'max_context': max_context,
-                               'y1': y1, 'y2': y2, 'example_id': example['id'], 'feature_id' : unique_id})
+                               'is_yes_no': is_yes_no, 'is_answerable': is_answerable, 'yes_no': yes_no,
+                               'y1': y1, 'y2': y2, 'example_id': example['id'], 'feature_id': unique_id})
             unique_id += 1
-
 
     dir_name = data_type
     try:
@@ -353,6 +396,7 @@ def build_features(config, examples, data_type, out_file):
     with jsonlines.open(f'{dir_name}/{name}_{str(num_files - 1)}.{ext}', mode='w') as writer:
         for datapoint in datapoints[(num_files - 1) * batch_size:]:
             writer.write(datapoint)
+
 
 def save(filename, obj, message=None):
     if message is not None:
