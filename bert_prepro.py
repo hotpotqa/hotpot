@@ -20,6 +20,7 @@ import string
 import copy
 from transformers import BertTokenizer
 import shutil
+import numpy as np
 
 BERT_MAX_SEQ_LEN = 512
 tokenizer = BertTokenizer.from_pretrained('bert-large-cased', return_token_type_ids=True)
@@ -108,6 +109,8 @@ def remove_punctuation(sent):
     return re.sub('[%s]' % re.escape(string.punctuation), '', sent)
 
 def preprocess(sent):
+    whitespaces = re.compile(r"\s+")
+    sent = whitespaces.sub(" ", sent)
     return sent.encode('latin-1', 'ignore').decode('latin-1')
 
 def encode(question, context, max_length, config):
@@ -140,8 +143,8 @@ def _process_article(article, config):
     N_tokens = 0
 
     def _process(sent, is_sup_fact=False):
+        #sent = sent + " "
         sent = preprocess(sent)
-        sent = " " + sent + " "
         nonlocal text_context, context_tokens, flat_offsets, start_end_facts, N_tokens
         N_chars = len(text_context)
         sent_tokens = tokenize(sent)
@@ -163,11 +166,15 @@ def _process_article(article, config):
 
     for para in paragraphs:
         cur_title, cur_para = para[0], para[1]
-        _process(cur_title)
+        _process(cur_title.strip() + " ")
         for sent_id, sent in enumerate(cur_para):
             is_sup_fact = (cur_title, sent_id) in sp_set
             sp_fact_cnt += is_sup_fact
             _process(sent, is_sup_fact)
+        text_context += ' [SEP] '
+        context_tokens += ['[SEP]']
+        N_tokens += 1
+
 
     is_answerable = True
     is_yes_no = False
@@ -193,6 +200,7 @@ def _process_article(article, config):
         answer = ''
         best_indices = [0, 0]
         is_answerable = False
+        print('UNANSWERABLE: ', article['_id'])
 
     answer_tokens = tokenizer.encode_plus(answer, padding='max_length', max_length=BERT_MAX_SEQ_LEN // 2,  truncation=True)['input_ids']
     question_tokens = tokenize(preprocess(article['question']))
@@ -277,6 +285,21 @@ def build_features(config, examples, data_type, out_file):
     span_ex_count = 0
     total_ex_count = len(examples)
     max_chunks = 0
+
+    #EDA
+    whole_span = 0
+    part_span = 0
+    whole_sup = 0
+    part_sup = 0
+
+    whole_span_ratio = 0
+    part_span_ratio = 0
+    whole_sup_ratio = 0
+    part_sup_ratio = 0
+
+    test_example = examples[0]
+    ten_chunks = 0
+
     for example in tqdm(examples):
         question_tokens = example['question_tokens']
         context_tokens = example['context_tokens']
@@ -297,6 +320,17 @@ def build_features(config, examples, data_type, out_file):
         doc_spans = []
         start_offset = 0
 
+        for i in range(len(context_tokens)):
+            if context_tokens[i] == '[SEP]' or i - start_offset == max_tokens_for_seq:
+                length = i - start_offset
+                doc_spans.append(_DocSpan(start=start_offset, length=length))
+                start_offset += min(length, doc_stride)
+            if start_offset == len(context_tokens):
+                break
+
+        if len(doc_spans) == 10:
+            ten_chunks += 1
+        '''
         while start_offset < len(context_tokens):
             length = len(context_tokens) - start_offset
             if length > max_tokens_for_seq:
@@ -305,7 +339,8 @@ def build_features(config, examples, data_type, out_file):
             if start_offset + length == len(context_tokens):
                 break
             start_offset += min(length, doc_stride)
-       
+        '''
+
         is_answerable_example = example['is_answerable']
         is_yes_no_example = example['is_yes_no']
         yes_no_example = example['yes_no']
@@ -369,7 +404,23 @@ def build_features(config, examples, data_type, out_file):
             # yes -- 1, no -- 0
             yes_no = 0
             answer_options = [1, 0]
+
             if config.is_training:
+                if is_answerable_example and (start >= doc_start and end <= doc_end):
+                    whole_span += 1
+                    whole_span_ratio += (end - start) / (doc_end - doc_start) 
+                elif is_answerable_example and (doc_start <= start <= doc_end or doc_start <= end <= doc_end):
+                    part_span += 1
+                    part_span_ratio += (max(0, (end - doc_start)) + max(0, doc_end - start))/ (doc_end - doc_start)
+
+                for s, e, sup in supportive_facts:
+                    if sup and (s >= doc_start and e <= doc_end):
+                        whole_sup += 1
+                        whole_sup_ratio += (e - s) / (doc_end - doc_start)
+                    elif sup and (doc_start <= s <= doc_end or doc_start <= e <= doc_end):
+                        part_sup += 1
+                        part_span_ratio += (max(0, (e - doc_start)) + max(0, doc_end - s))/ (doc_end - doc_start)
+
                 if not is_answerable_example or \
                         (is_answerable_example and not is_yes_no_example and not (start >= doc_start and end <= doc_end)):
                     y1, y2 = 0, 0
@@ -391,15 +442,21 @@ def build_features(config, examples, data_type, out_file):
                 span_count += is_answerable * (1 - is_yes_no)
                 unanswerable_count += (1 - is_answerable)
                 total_count += 1
-            labels = [is_answerable, is_yes_no, yes_no, y1, y2]
+            labels = [is_answerable, is_yes_no, yes_no, y1, y2, is_answerable_example]
             datapoints.append({'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
                                'max_context': max_context, 'feature_id': unique_id, 'example_id': example['id'],
                                'labels' : labels})
             unique_id += 1
 
-    print(f'max chunks: {max_chunks}')
-    print(f"unanswerable: {unanswerable_count / total_count}, yes_no: {yes_no_count / total_count}, span: {span_count / total_count}")
+    print(f"max chunks: {max_chunks}")
+    print(f"unanswerable num: {unanswerable_count}, yes_no: {yes_no_count}, span: {span_count}, total: {total_count}")
+    print(f"unanswerable: {unanswerable_count / total_count:.5f}, yes_no: {yes_no_count / total_count:.5f}, span: {span_count / total_count:.5f}")
     print(f"unansweravle examples: {unanswerable_ex_count}, yes_no_examples: {yes_no_ex_count}, span: {span_ex_count}")
+    print(f"whole span chunks: {whole_span / total_count:.5f}, whole span token ratio: {whole_span_ratio / whole_span:.5f}")
+    print(f"whole supportive fact chunks: {whole_sup / total_count:.5f}, whole supportive fact token ratio: {whole_sup_ratio / whole_sup:.5f}")
+    print(f"partial span chunks: {part_span / total_count:5f}, partial span token ratio: {part_span_ratio / part_span if part_span != 0 else 0:.5f}")
+    print(f"partial supportive fact chunks: {part_sup / total_count:.5f}, partial supportive fact token ratio: {part_sup_ratio / part_sup if part_sup != 0 else 0:.5f}")
+    print(f"Examples in 10 chunks: {ten_chunk}, total examples: {len(examples)}")
 
     yes_no_examples = []
     for datapoint in datapoints:
@@ -487,6 +544,15 @@ def save(filename, obj, message=None):
 def prepro(config):
     random.seed(13)
     examples, eval_examples = process_file(config.data_file, config)
+
+    return
+    test_example = eval_examples[0]
+    test_spans = test_example['spans']
+    print('SPAN EXAMPLES:')
+    for i in range(10):
+        idx = np.random.randint(len(test_spans))
+        span = test_spans[idx]
+        print(test_example['context'][span[0]: span[1]])
 
     print(len(examples), len(eval_examples))
     if config.data_split == 'train':
