@@ -1,23 +1,18 @@
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 import random
 from tqdm import tqdm
-import spacy
 import ujson as json
 import jsonlines
 import pickle
 import collections
-from collections import Counter
-import numpy as np
 import os.path
-import argparse
-import torch
 import os
 from joblib import Parallel, delayed
-from util import normalize_answer
-import torch
 import bisect
 import re
 import string
-import copy
 from transformers import BertTokenizer
 import shutil
 import numpy as np
@@ -26,8 +21,28 @@ BERT_MAX_SEQ_LEN = 512
 tokenizer = BertTokenizer.from_pretrained('bert-large-cased', return_token_type_ids=True)
 
 
+def print_chunks(chunks):
+    """
+    prints chunks' context text
+    :param chunks: a list of chunks
+    """
+    for i, chunk in enumerate(chunks):
+        text = tokenizer.decode(chunk['input_ids'])
+        # 'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
+        print(f'chunk num: {i}, chunk text: \n{text}\n')
+
+
 def find_nearest(a, target, test_func=lambda x: True):
+    """
+    find a token start/end which is closest to the answer span start/end
+    :param a: (List[int]) sorted list of starts/ends of the tokens in the context
+    :param target: (int) start/end of the answer span
+    :param test_func: filter function to ensure result is in the correct range
+    :return: idx of the token s/e closest to target, dissimilarity score
+    """
+    # bisect.bisect_left(list, x) returns a position to insert x in the sorted list
     idx = bisect.bisect_left(a, target)
+    # s/e of the answer span is the same as s/e of one of the tokens
     if (0 <= idx < len(a)) and a[idx] == target:
         return idx, 0
     elif idx == 0:
@@ -43,18 +58,27 @@ def find_nearest(a, target, test_func=lambda x: True):
             return idx, d1
 
 
-def fix_span(parastr, offsets, span):
+def fix_span(text_context, offsets, span):
+    """
+    find start-end indices of the span in the text_context nearest to the existing token start-end indices
+    :param text_context: (str) text to search for span in
+    :param offsets: (List(Tuple[int, int]) list of begins and ends for each token in the text
+    :param span: (str) the answer span to find in the text_context
+    :return: span indices, distance to the nearest token indices
+    """
     span = span.strip()
-    assert span in parastr, '{}\t{}'.format(span, parastr)
+    assert span in text_context, f'answer span:{span} is not in the context: {text_context}'
     begins, ends = map(list, zip(*[x for x in offsets]))
 
     best_dist = 1e200
     best_indices = None
 
-    if span == parastr:
-        return parastr, (0, len(parastr)), 0
+    if span == text_context:
+        return text_context, (0, len(text_context)), 0
 
-    for m in re.finditer(re.escape(span), parastr):
+    # re.escape(pattern) escapes (adds '\' to special characters in pattern)
+    # re.finditer(pattern, string) returns match objects for all matches of pattern in the string
+    for m in re.finditer(re.escape(span), text_context):
         begin_offset, end_offset = m.span()
         fixed_begin, d1 = find_nearest(begins, begin_offset, lambda x: x < end_offset)
         fixed_end, d2 = find_nearest(ends, end_offset, lambda x: x > begin_offset)
@@ -69,16 +93,21 @@ def fix_span(parastr, offsets, span):
 
 
 def convert_idx(text, tokens, filter=lambda x: x):
+    """
+    finds spans for each token in the text
+    :param text: (str) context to look for token in
+    :param tokens: (List[str]) tokenized text
+    :param filter: a function to filter tokenization artefacts (e.g. '[UNK]' or '#' in the middle of a word)
+    :return: (List[Tuple(int, int)]) spans for each token
+    """
     current = 0
     spans = []
     for token in tokens:
-        if token == '[UNK]':
-            token = ''
         clear_token = filter(token)
         current = text.find(clear_token, current)
-        if current < 0:
-            print(token, clear_token, text)
-            raise Exception()
+
+        assert current >= 0, f'token: {token}, cleared token: {clear_token}, text: {text}'
+
         spans.append((current, current + len(clear_token)))
         current += len(clear_token)
     return spans
@@ -97,6 +126,8 @@ def filter(token):
     :param token: (str) word or part of word after tokenization
     :return: (str) token as a word or part of word (whithout extra chars)
     """
+    if token == '[UNK]':
+        token = ''
     symbols = '#' #chars that need to be filtered out (e. g. '#' for BERT-like tokenization)
     return token.lstrip(symbols)
 
@@ -108,12 +139,19 @@ def remove_punctuation(sent):
     """
     return re.sub('[%s]' % re.escape(string.punctuation), '', sent)
 
+
 def preprocess(sent):
+    """
+    substitute multiple spaces with one and remove non latin-1 symbols
+    :param sent: string to process
+    :return: the string without multiple spaces and latin-1 as encoding
+    """
     whitespaces = re.compile(r"\s+")
     sent = whitespaces.sub(" ", sent)
     return sent.encode('latin-1', 'ignore').decode('latin-1')
 
-def encode(question, context, max_length, config):
+
+def encode(question, context, max_length):
     """
     :param question: (str) question in nl
     :param context: (str) the whole context concatenated
@@ -124,18 +162,19 @@ def encode(question, context, max_length, config):
     return encoding["input_ids"], encoding["attention_mask"], encoding["token_type_ids"]
 
 
-def _process_article(article, config):
+def _process_article(article):
     """
+    processes the article and turns it into a train dict with features and eval dict with context and answer
     :param article: dict corresponding to a single qa pair
-    article.keys(): 'supporting_facts' (list of lists), 'level' (str 'easy', 'medium', 'hard'), 'question' (str),
-    'context' (list of lists [title (str), list of sentences (str)], 'answer' (str),  '_id' (str), 'type' (str e.g. 'comparison', 'bridge')
-    :param config: class with training params as fields
-    :return: dicts with features for train and eval
+    article.keys(): 'supporting_facts' (List[List[int]]), 'level' (str 'easy', 'medium', 'hard'),
+    'question' (str), 'context' (List[List[Tuple(title (str), sentences (List[str])],
+    'answer' (str),  '_id' (str), 'type' (str e.g. 'comparison', 'bridge')
+    :return: dicts with features for train and eval e.g
+     'start_end_facts' (List[Tuple[int]]) (s_token_id, e_token_id, is_sup_fact),
+     'question tokens' [List[int]] token indices for the question
+    ...
     """
     paragraphs = article['context']
-    # some articles in the fullwiki dev/test sets have zero paragraphs
-    if len(paragraphs) == 0:
-        paragraphs = [['some random title', ['some random stuff']]]
 
     text_context, context_tokens = '', []
     flat_offsets = []
@@ -143,7 +182,6 @@ def _process_article(article, config):
     N_tokens = 0
 
     def _process(sent, is_sup_fact=False):
-        #sent = sent + " "
         sent = preprocess(sent)
         nonlocal text_context, context_tokens, flat_offsets, start_end_facts, N_tokens
         N_chars = len(text_context)
@@ -175,8 +213,6 @@ def _process_article(article, config):
         context_tokens += ['[SEP]']
         N_tokens += 1
 
-
-    is_answerable = True
     is_yes_no = False
     yes_no = None  # 0 if 'no', 1 otherwise
     
@@ -189,46 +225,52 @@ def _process_article(article, config):
             yes_no = int(answer == 'yes')
         else:
             if answer not in text_context:
-                # in the fullwiki setting, the answer might not have been retrieved
-                # use (0, 1) so that we can proceed
                 answer = ''
-                is_answerable = False
             else:
                 best_indices, _ = fix_span(text_context, flat_offsets, answer)
     else:
         # some random stuff
         answer = ''
         best_indices = [0, 0]
-        is_answerable = False
         print('UNANSWERABLE: ', article['_id'])
 
-    answer_tokens = tokenizer.encode_plus(answer, padding='max_length', max_length=BERT_MAX_SEQ_LEN // 2,  truncation=True)['input_ids']
     question_tokens = tokenize(preprocess(article['question']))
 
     example = {'question_tokens': question_tokens, 'context_tokens': context_tokens,
-               'y1s': best_indices[0], 'y2s': best_indices[1], 'id': article['_id'],
-               'start_end_facts': start_end_facts, 'is_answerable': is_answerable, 'is_yes_no': is_yes_no, 'yes_no': yes_no}
+               's': best_indices[0], 'e': best_indices[1], 'id': article['_id'],
+               'start_end_facts': start_end_facts, 'is_yes_no': is_yes_no, 'yes_no': yes_no}
     eval_example = {'context': text_context, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
     return example, eval_example
 
 
 def process_file(filename, config):
+    """
+    processes all articles
+    :param filename: (str) path to the .json file
+    :param config: config class
+    :return: List[Dict] train features, List[Dict] eval features (such as full context text and correct answer)
+    """
     data = json.load(open(filename, 'r'))
 
-    eval_examples = {}
-
-    outputs = Parallel(n_jobs=12, verbose=10)(delayed(_process_article)(article, config) for article in data)
+    outputs = Parallel(n_jobs=12, verbose=10)(delayed(_process_article)(article) for article in data)
     examples = [e[0] for e in outputs]
     eval_examples = [e[1] for e in outputs]
 
     random.shuffle(examples)
-    print("{} questions in total".format(len(examples)))
+    print(f"{len(examples)} questions in total")
 
     return examples, eval_examples
 
 
 def _check_is_max_context(doc_spans, cur_span_index, position):
-    """Check if this is the 'max context' doc span for the token."""
+    """
+    Check if this is the 'max context' doc span for the token.
+    :param doc_spans: List[NamedTuple(start: int, length: int)] sorted by start
+    :param cur_span_index: index of current doc_span (in doc_spans)
+    :param position: position of the token to check for max_span
+    :return: bool whether token in position has max context
+    """
+
     # Because of the sliding window approach taken to scoring documents, a single
     # token can appear in multiple documents. E.g.
     #  Doc: the man went to the store and bought a gallon of milk
@@ -251,7 +293,7 @@ def _check_is_max_context(doc_spans, cur_span_index, position):
     for (span_index, doc_span) in enumerate(doc_spans):
         end = doc_span.start + doc_span.length - 1
         if position < doc_span.start:
-            continue
+            break
         if position > end:
             continue
         num_left_context = position - doc_span.start
@@ -264,26 +306,52 @@ def _check_is_max_context(doc_spans, cur_span_index, position):
     return cur_span_index == best_span_index
 
 
-def build_features(config, examples, data_type, out_file):
-    if data_type == 'test':
-        max_seq_len = 100000
-    else:
-        max_seq_len = BERT_MAX_SEQ_LEN
-    print("Processing {} examples...".format(data_type))
+def write_datapoints(datapoints, writer):
+    """
+    write datapoints to a file, remember the beginning and ending lines for the yes/no questions
+    :param datapoints: List[Dict] a batch of data points
+    :param writer: file handler of a file to write to
+    :return: examples List[Tuple[int, int]] the beginning and ending lines for the yes/no questions
+    """
+    examples = []  # holds beginning and ending lines of each example in the respective file
+    start = 0
+    ex_id = None
+    is_y_n = False
+    for dp_idx, datapoint in enumerate(datapoints):
+        if ex_id and datapoint['example_id'] != ex_id:
+            end = dp_idx
+            if is_y_n:
+                examples.append((start, end))
+            start = end
+        ex_id = datapoint['example_id']
+        is_y_n = datapoint['labels'][0]
+        writer.write(datapoint)
+    return examples
+
+
+def build_features(config, examples, split, out_file):
+    """
+    make chunks of size config.max_seq_length to train a BERT-like model
+    each chunk corresponds to a single context text or part of the text
+    :param config: config class
+    :param examples: (List[Dict]) example dict for each question context pair
+    :param split: 'train', 'dev' or 'test'
+    :param out_file: (.pickle) dumps all features to config.num_files pickle
+    files {split}/{out_file (without extention)}_{i}.pickle
+    """
+    print(f"Processing {split} examples...")
     datapoints = []
-    doc_stride = config.doc_stride
-    
+    yes_no_example_id_to_ans = {}
+
     unique_id = 0
 
-    unanswerable_count = 0
     yes_no_count = 0
     span_count = 0
+    same_span_count = 0
     total_count = 0
 
-    unanswerable_ex_count = 0
     yes_no_ex_count = 0
     span_ex_count = 0
-    total_ex_count = len(examples)
     max_chunks = 0
 
     #EDA
@@ -292,28 +360,24 @@ def build_features(config, examples, data_type, out_file):
     whole_sup = 0
     part_sup = 0
 
-    whole_span_ratio = 0
-    part_span_ratio = 0
-    whole_sup_ratio = 0
-    part_sup_ratio = 0
-
-    test_example = examples[0]
     ten_chunks = 0
+    cropped_questions = 0
 
     for example in tqdm(examples):
         question_tokens = example['question_tokens']
         context_tokens = example['context_tokens']
         if len(question_tokens) > config.max_query_length:
-            question_tokens = question_tokens[0 : config.max_query_length]
+            question_tokens = question_tokens[0: config.max_query_length]
+            cropped_questions += 1
         question_shift = len(question_tokens) + 2  # [CLS] + question + [SEP]
         # answer span is based on context_text tokens only but after encoding
         #  question and special tokens are added in front
 
-        # The -3 accounts for [CLS], [SEP] and [SEP]
-        max_tokens_for_seq = config.max_seq_length - len(question_tokens) - 3
+        # The -1 accounts for [SEP] after context
+        max_tokens_for_seq = config.max_seq_length - question_shift - 1
 
         if config.is_training:
-            start, end = example["y1s"], example["y2s"]
+            start, end = example["s"], example["e"]
 
         _DocSpan = collections.namedtuple(
             "DocSpan", ["start", "length"])
@@ -324,33 +388,28 @@ def build_features(config, examples, data_type, out_file):
             if context_tokens[i] == '[SEP]' or i - start_offset == max_tokens_for_seq:
                 length = i - start_offset
                 doc_spans.append(_DocSpan(start=start_offset, length=length))
-                start_offset += min(length, doc_stride)
+                if context_tokens[i] == '[SEP]':
+                    start_offset += length
+                else:
+                    start_offset += config.doc_stride
             if start_offset == len(context_tokens):
                 break
 
-        if len(doc_spans) == 10:
+        num_chunks = len(doc_spans)
+        if num_chunks == 10:
             ten_chunks += 1
-        '''
-        while start_offset < len(context_tokens):
-            length = len(context_tokens) - start_offset
-            if length > max_tokens_for_seq:
-                length = max_tokens_for_seq
-            doc_spans.append(_DocSpan(start=start_offset, length=length))
-            if start_offset + length == len(context_tokens):
-                break
-            start_offset += min(length, doc_stride)
-        '''
 
-        is_answerable_example = example['is_answerable']
         is_yes_no_example = example['is_yes_no']
         yes_no_example = example['yes_no']
 
-        unanswerable_ex_count += (1 - is_answerable_example)
+        if is_yes_no_example:
+            yes_no_example_id_to_ans[example['id']] = example['yes_no']
         yes_no_ex_count += is_yes_no_example
-        span_ex_count += (1 - is_yes_no_example) * is_answerable_example
+        span_ex_count += 1 - is_yes_no_example
 
         supportive_facts = example['start_end_facts']
-        max_chunks = max(max_chunks, len(doc_spans))
+        max_chunks = max(max_chunks, num_chunks)
+
         for (doc_span_index, doc_span) in enumerate(doc_spans):
             tokens = []
             segment_ids = []
@@ -368,7 +427,8 @@ def build_features(config, examples, data_type, out_file):
             segment_ids.append(0)
             max_context.append(0)
 
-            for i in range(doc_span.length):
+            st = 0 if context_tokens[doc_span.start] != '[SEP]' else 1
+            for i in range(st, doc_span.length):
                 split_token_index = doc_span.start + i
 
                 max_context.append(int(_check_is_max_context(doc_spans, doc_span_index,
@@ -382,7 +442,8 @@ def build_features(config, examples, data_type, out_file):
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
             input_mask = [1] * len(input_ids)
 
-            pad_len = max_seq_len - len(input_ids)
+            input_len = len(input_ids)
+            pad_len = config.max_seq_length - input_len
             pad = [0] * pad_len
 
             input_ids.extend(pad)
@@ -398,75 +459,54 @@ def build_features(config, examples, data_type, out_file):
             doc_start = doc_span.start
             doc_end = doc_span.start + doc_span.length - 1
 
-            y1, y2 = 0, 0
-            is_answerable = 0
-            is_yes_no = 0
+            span_s, span_e = 0, 0
+            is_yes_no = is_yes_no_example
             # yes -- 1, no -- 0
-            yes_no = 0
-            answer_options = [1, 0]
+            yes_no = -1
+            if is_yes_no:
+                yes_no = yes_no_example
 
             if config.is_training:
-                if is_answerable_example and (start >= doc_start and end <= doc_end):
+                if start >= doc_start and end <= doc_end:
                     whole_span += 1
-                    whole_span_ratio += (end - start) / (doc_end - doc_start) 
-                elif is_answerable_example and (doc_start <= start <= doc_end or doc_start <= end <= doc_end):
+                    span_s = start - doc_start + question_shift
+                    span_e = end - doc_start + question_shift
+                    assert 0 <= span_s < config.max_seq_length, f'starts are wrong, {span_s}'
+                    assert 0 <= span_e < config.max_seq_length, f'ends are wrong, {span_e}'
+                elif doc_start <= start <= doc_end or doc_start <= end <= doc_end:
                     part_span += 1
-                    part_span_ratio += (max(0, (end - doc_start)) + max(0, doc_end - start))/ (doc_end - doc_start)
+                    same_span_count += (1 - is_yes_no)
+                else:
+                    same_span_count += (1 - is_yes_no)
 
                 for s, e, sup in supportive_facts:
                     if sup and (s >= doc_start and e <= doc_end):
                         whole_sup += 1
-                        whole_sup_ratio += (e - s) / (doc_end - doc_start)
                     elif sup and (doc_start <= s <= doc_end or doc_start <= e <= doc_end):
                         part_sup += 1
-                        part_span_ratio += (max(0, (e - doc_start)) + max(0, doc_end - s))/ (doc_end - doc_start)
 
-                if not is_answerable_example or \
-                        (is_answerable_example and not is_yes_no_example and not (start >= doc_start and end <= doc_end)):
-                    y1, y2 = 0, 0
-                elif is_answerable_example and (start >= doc_start and end <= doc_end):
-                    y1 = start - doc_start + question_shift
-                    y2 = end - doc_start + question_shift
-                    is_answerable = 1
-                if is_yes_no_example:
-                    is_yes_no = 1
-                    for s, e, sup in supportive_facts:
-                        if sup and (s >= doc_start and e <= doc_end):
-                            is_answerable = 1
-                            yes_no = answer_options[start]
-                            y1, y2 = start, end
-                            break
-                    else:
-                        y1, y2 = 0, 0
                 yes_no_count += is_yes_no
-                span_count += is_answerable * (1 - is_yes_no)
-                unanswerable_count += (1 - is_answerable)
+                span_count += (1 - is_yes_no)
                 total_count += 1
-            labels = [is_answerable, is_yes_no, yes_no, y1, y2, is_answerable_example]
+            labels = [is_yes_no, yes_no, span_s, span_e]
             datapoints.append({'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
                                'max_context': max_context, 'feature_id': unique_id, 'example_id': example['id'],
-                               'labels' : labels})
+                               'labels': labels, 'seq_len': input_len})
             unique_id += 1
 
     print(f"max chunks: {max_chunks}")
-    print(f"unanswerable num: {unanswerable_count}, yes_no: {yes_no_count}, span: {span_count}, total: {total_count}")
-    print(f"unanswerable: {unanswerable_count / total_count:.5f}, yes_no: {yes_no_count / total_count:.5f}, span: {span_count / total_count:.5f}")
-    print(f"unansweravle examples: {unanswerable_ex_count}, yes_no_examples: {yes_no_ex_count}, span: {span_ex_count}")
-    print(f"whole span chunks: {whole_span / total_count:.5f}, whole span token ratio: {whole_span_ratio / whole_span:.5f}")
-    print(f"whole supportive fact chunks: {whole_sup / total_count:.5f}, whole supportive fact token ratio: {whole_sup_ratio / whole_sup:.5f}")
-    print(f"partial span chunks: {part_span / total_count:5f}, partial span token ratio: {part_span_ratio / part_span if part_span != 0 else 0:.5f}")
-    print(f"partial supportive fact chunks: {part_sup / total_count:.5f}, partial supportive fact token ratio: {part_sup_ratio / part_sup if part_sup != 0 else 0:.5f}")
-    print(f"Examples in 10 chunks: {ten_chunk}, total examples: {len(examples)}")
+    print(f"yes_no: {yes_no_count}, span: {span_count}, same span (span with no answer): {same_span_count}, "
+          f"total: {total_count}")
+    print(f"yes_no: {yes_no_count / total_count:.5f}, span: {span_count / total_count:.5f}")
+    print(f"yes_no_examples: {yes_no_ex_count}, span: {span_ex_count}")
+    print(f"whole span chunks ratio: {whole_span / span_count:.5f}")
+    print(f"whole supportive fact chunks ratio: {whole_sup / total_count:.5f}")
+    print(f"partial span chunks ratio: {part_span / span_count:5f}")
+    print(f"partial supportive fact chunks ratio: {part_sup / total_count:.5f}")
+    print(f"Examples in 10 chunks: {ten_chunks}, total examples: {len(examples)}")
+    print(f"Examples with questions longer than {config.max_query_length} tokens: {cropped_questions}")
 
-    yes_no_examples = []
-    for datapoint in datapoints:
-        is_y_n = datapoint['labels'][1]
-        ex_id = datapoint['example_id']
-        if is_y_n:
-            yes_no_examples.append(ex_id)
-    print(f'YES NO EXAMPLES IN THE DATA: {len(set(yes_no_examples))}')
-
-    dir_name = data_type
+    dir_name = split
     try:
         os.mkdir(dir_name)
         print(f"Directory {dir_name} created")
@@ -474,33 +514,26 @@ def build_features(config, examples, data_type, out_file):
         print(f"Removing directory {dir_name} and creating a new one")
         shutil.rmtree(dir_name)
         os.mkdir(dir_name)
+
+    with open(f'{dir_name}/{config.yes_no_example_file}', "wb") as fp:
+        pickle.dump([yes_no_example_id_to_ans], fp)
+
     fileparts = out_file.split('.')
     name, ext = '.'.join(fileparts[:-1]), fileparts[-1]
     num_objects = len(datapoints)
     num_files = config.num_files if config.num_files > 0 else num_objects
     batch_size = num_objects // num_files
     st = 0
-    # dividing datapoints between mltiple files for using lazy dataloading with multiple workers
+    # dividing datapoints into multiple files for using lazy data loading with multiple workers
     # files are supposed to be of approximately equal size, but we do not want to split examples between files
 
     examples_total = 0
     for i in range(num_files - 1):
-        examples = [] # holds starting and ending lines of the examples in the respective file
-        start = 0
-        ex_id = None
-        is_y_n = False
         with jsonlines.open(f'{dir_name}/{name}_{str(i)}.{ext}', mode='w') as writer:
-            for dp_idx, datapoint in enumerate(datapoints[st: (i + 1) * batch_size]):
-                if ex_id and datapoint['example_id'] != ex_id:
-                    end = dp_idx
-                    if is_y_n:
-                        examples.append((start, end))
-                    start = end
-                ex_id = datapoint['example_id']
-                is_y_n = datapoint['labels'][1]
-                writer.write(datapoint)
+            examples = write_datapoints(datapoints[st: (i + 1) * batch_size], writer)
             last_ex_id = datapoints[(i + 1) * batch_size - 1]['example_id']
             j = (i + 1) * batch_size
+            is_y_n = datapoints[j]['labels'][0]
             while datapoints[j]['example_id'] == last_ex_id:
                 writer.write(datapoints[j])
                 j += 1
@@ -510,29 +543,18 @@ def build_features(config, examples, data_type, out_file):
         examples_total += len(examples)
         with open(f'{dir_name}/{name}_{str(i)}_meta.pickle', mode='wb') as fp:
             pickle.dump(examples, fp)
-    
-    examples = [] # holds starting and ending lines of the examples in the respective file
-    start = 0
-    ex_id = None
-    is_y_n = False
 
     with jsonlines.open(f'{dir_name}/{name}_{str(num_files - 1)}.{ext}', mode='w') as writer:
-        for dp_idx, datapoint in enumerate(datapoints[st:]):
-            if ex_id and datapoint['example_id'] != ex_id:
-                end = dp_idx
-                if is_y_n:
-                    examples.append((start, end))
-                start = end
-            ex_id = datapoint['example_id']
-            is_y_n = datapoint['labels'][1]
-            writer.write(datapoint)
-        end = dp_idx
+        examples = write_datapoints(datapoints[st:], writer)
+        end = len(datapoints) - st - 1
+        is_y_n = datapoints[end]['labels'][0]
         if is_y_n:
             examples.append((start, end))
     examples_total += len(examples)
     print(f'EXAMPLES IN THE DATASET: {examples_total}')
     with open(f'{dir_name}/{name}_{str(num_files - 1)}_meta.pickle', mode='wb') as fp:
         pickle.dump(examples, fp)
+
 
 def save(filename, obj, message=None):
     if message is not None:
@@ -542,10 +564,13 @@ def save(filename, obj, message=None):
 
 
 def prepro(config):
+    """
+    process all files and build features for BERT-like models, save them to files
+    :param config: config class
+    """
     random.seed(13)
     examples, eval_examples = process_file(config.data_file, config)
 
-    return
     test_example = eval_examples[0]
     test_spans = test_example['spans']
     print('SPAN EXAMPLES:')
