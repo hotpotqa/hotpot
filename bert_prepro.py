@@ -1,6 +1,7 @@
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
+import csv
 import random
 from tqdm import tqdm
 import ujson as json
@@ -16,7 +17,10 @@ import string
 from transformers import BertTokenizer
 import shutil
 import numpy as np
+from gensim import corpora
+from gensim.summarization import bm25
 
+N_ARTICLES = 10
 BERT_MAX_SEQ_LEN = 512
 tokenizer = BertTokenizer.from_pretrained('bert-large-cased', return_token_type_ids=True)
 
@@ -121,7 +125,7 @@ def tokenize(sent):
     return tokenizer.tokenize(sent)
 
 
-def filter(token):
+def filter_func(token):
     """
     :param token: (str) word or part of word after tokenization
     :return: (str) token as a word or part of word (whithout extra chars)
@@ -176,21 +180,24 @@ def _process_article(article):
     """
     paragraphs = article['context']
 
-    text_context, context_tokens = '', []
+    context_text, context_tokens = '', []
     flat_offsets = []
     start_end_facts = []  # (start_token_id, end_token_id, is_sup_fact=True/False)
-    N_tokens = 0
+    sup_paragraphs = [0] * len(paragraphs) # 1 if paragraph contains supportive fact, else 0
+    para_context_text = []
+    para_context_tokens = []
+    N_tokens, N_chars = 0, 0
 
     def _process(sent, is_sup_fact=False):
         sent = preprocess(sent)
-        nonlocal text_context, context_tokens, flat_offsets, start_end_facts, N_tokens
-        N_chars = len(text_context)
+        nonlocal context_text, context_tokens, flat_offsets, start_end_facts, N_tokens, N_chars
         sent_tokens = tokenize(sent)
-        sent_spans = convert_idx(sent, sent_tokens, filter)
+        sent_spans = convert_idx(sent, sent_tokens, filter_func)
         sent_spans = [[N_chars+e[0], N_chars+e[1]] for e in sent_spans]
-        text_context += sent
+        context_text += sent
         context_tokens.extend(sent_tokens)
         flat_offsets.extend(sent_spans)
+        N_chars += len(sent)
         sent_N_tokens = len(sent_tokens)
         start_end_facts.append((N_tokens, N_tokens + sent_N_tokens, is_sup_fact))
         N_tokens += sent_N_tokens
@@ -202,20 +209,33 @@ def _process_article(article):
 
     sp_fact_cnt = 0
 
-    for para in paragraphs:
+    for i, para in enumerate(paragraphs):
         cur_title, cur_para = para[0], para[1]
         _process(cur_title.strip() + " ")
         for sent_id, sent in enumerate(cur_para):
             is_sup_fact = (cur_title, sent_id) in sp_set
+            sup_paragraphs[i] |= is_sup_fact
             sp_fact_cnt += is_sup_fact
             _process(sent, is_sup_fact)
-        text_context += ' [SEP] '
-        context_tokens += ['[SEP]']
-        N_tokens += 1
+        para_context_text.append(context_text)
+        para_context_tokens.append(context_tokens)
+        context_text = "\n"
+        context_tokens = []
+        N_chars += 1
+
+    question = preprocess(article['question'])
+    texts = [para.split() for para in para_context_text]
+    dictionary = corpora.Dictionary(texts)
+    corpus = [dictionary.doc2bow(text) for text in texts]
+    bm25_obj = bm25.BM25(corpus)
+    query_doc = dictionary.doc2bow(question.split())
+    scores = bm25_obj.get_scores(query_doc)
+
+    full_text = ''.join(para_context_text)
 
     is_yes_no = False
     yes_no = None  # 0 if 'no', 1 otherwise
-    
+   
     if 'answer' in article.keys():
         best_indices = [0, 0]
         answer = preprocess(article['answer'].strip())
@@ -224,22 +244,25 @@ def _process_article(article):
             answer = answer.lower()
             yes_no = int(answer == 'yes')
         else:
-            if answer not in text_context:
+            if answer not in full_text:
                 answer = ''
             else:
-                best_indices, _ = fix_span(text_context, flat_offsets, answer)
+                best_indices, _ = fix_span(full_text, flat_offsets, answer)
     else:
         # some random stuff
         answer = ''
         best_indices = [0, 0]
         print('UNANSWERABLE: ', article['_id'])
 
-    question_tokens = tokenize(preprocess(article['question']))
+    assert 2 <= sum(sup_paragraphs) <= 2, f'wrong number of sup paragraphs: {sum(sup_paragraphs)}'
 
-    example = {'question_tokens': question_tokens, 'context_tokens': context_tokens,
+    question_tokens = tokenize(question)
+
+    example = {'question_tokens': question_tokens, 'context_tokens': para_context_tokens,
                's': best_indices[0], 'e': best_indices[1], 'id': article['_id'],
-               'start_end_facts': start_end_facts, 'is_yes_no': is_yes_no, 'yes_no': yes_no}
-    eval_example = {'context': text_context, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
+               'start_end_facts': start_end_facts, 'sup_paragraphs': sup_paragraphs, 'bm25_scores': scores,
+               'is_yes_no': is_yes_no, 'yes_no': yes_no}
+    eval_example = {'context': full_text, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
     return example, eval_example
 
 
@@ -252,7 +275,12 @@ def process_file(filename, config):
     """
     data = json.load(open(filename, 'r'))
 
-    outputs = Parallel(n_jobs=12, verbose=10)(delayed(_process_article)(article) for article in data)
+
+    with open('filter_ids.csv', newline='') as f:
+        reader = csv.reader(f)
+        _, ids_to_filter = zip(*list(reader))
+    print(f'ids to filter: {ids_to_filter[1:5]}')
+    outputs = Parallel(n_jobs=12, verbose=10)(delayed(_process_article)(article) for article in data if article['_id'] not in ids_to_filter)
     examples = [e[0] for e in outputs]
     eval_examples = [e[1] for e in outputs]
 
@@ -320,13 +348,14 @@ def write_datapoints(datapoints, writer):
     for dp_idx, datapoint in enumerate(datapoints):
         if ex_id and datapoint['example_id'] != ex_id:
             end = dp_idx
-            if is_y_n:
-                examples.append((start, end))
+            #if is_y_n:
+            #    examples.append((start, end))
+            examples.append((start, end))
             start = end
         ex_id = datapoint['example_id']
         is_y_n = datapoint['labels'][0]
         writer.write(datapoint)
-    return examples
+    return examples, start
 
 
 def build_features(config, examples, split, out_file):
@@ -360,10 +389,15 @@ def build_features(config, examples, split, out_file):
     whole_sup = 0
     part_sup = 0
 
+    sup_chunks = 0
+
     ten_chunks = 0
     cropped_questions = 0
 
-    for example in tqdm(examples):
+    n_examples = len(examples)
+    ranks = np.zeros(n_examples, dtype=int)
+
+    for i, example in enumerate(tqdm(examples)):
         question_tokens = example['question_tokens']
         context_tokens = example['context_tokens']
         if len(question_tokens) > config.max_query_length:
@@ -377,23 +411,30 @@ def build_features(config, examples, split, out_file):
         max_tokens_for_seq = config.max_seq_length - question_shift - 1
 
         if config.is_training:
-            start, end = example["s"], example["e"]
+            start, end = example['s'], example['e']
 
         _DocSpan = collections.namedtuple(
-            "DocSpan", ["start", "length"])
+            'DocSpan', ['para', 'start', 'length'])
         doc_spans = []
-        start_offset = 0
+        para_ids = []
+        sup_paras = np.array(example["sup_paragraphs"])
+        scores = example["bm25_scores"]
+        sorted_idx = np.argsort(-np.array(scores))
+        ranks[i] = np.argmax(sup_paras[sorted_idx] * np.arange(1, len(sup_paras) + 1))
 
-        for i in range(len(context_tokens)):
-            if context_tokens[i] == '[SEP]' or i - start_offset == max_tokens_for_seq:
-                length = i - start_offset
-                doc_spans.append(_DocSpan(start=start_offset, length=length))
-                if context_tokens[i] == '[SEP]':
-                    start_offset += length
-                else:
-                    start_offset += config.doc_stride
-            if start_offset == len(context_tokens):
-                break
+        assert sum(sup_paras) == 2, 'wrong number of supportive facts'
+
+        for para_i, para_tokens in enumerate(context_tokens):
+            start_offset = 0
+            length = len(para_tokens)
+
+            while length > max_tokens_for_seq:
+                doc_spans.append(_DocSpan(para_i, start=start_offset, length=max_tokens_for_seq))
+                start_offset += config.doc_stride
+                length -= config.doc_stride
+
+            doc_spans.append(_DocSpan(para_i, start=start_offset, length=length))
+
 
         num_chunks = len(doc_spans)
         if num_chunks == 10:
@@ -427,13 +468,12 @@ def build_features(config, examples, split, out_file):
             segment_ids.append(0)
             max_context.append(0)
 
-            st = 0 if context_tokens[doc_span.start] != '[SEP]' else 1
-            for i in range(st, doc_span.length):
+            for i in range(doc_span.length):
                 split_token_index = doc_span.start + i
 
                 max_context.append(int(_check_is_max_context(doc_spans, doc_span_index,
                                                        split_token_index)))
-                tokens.append(context_tokens[split_token_index])
+                tokens.append(context_tokens[doc_span.para][split_token_index])
                 segment_ids.append(1)
             tokens.append("[SEP]")
             segment_ids.append(1)
@@ -458,6 +498,10 @@ def build_features(config, examples, split, out_file):
 
             doc_start = doc_span.start
             doc_end = doc_span.start + doc_span.length - 1
+
+            para_ids.append(doc_span.para)
+            is_sup = int(sup_paras[doc_span.para])
+            sup_chunks += is_sup
 
             span_s, span_e = 0, 0
             is_yes_no = is_yes_no_example
@@ -488,13 +532,13 @@ def build_features(config, examples, split, out_file):
                 yes_no_count += is_yes_no
                 span_count += (1 - is_yes_no)
                 total_count += 1
-            labels = [is_yes_no, yes_no, span_s, span_e]
+            labels = [is_yes_no, yes_no, span_s, span_e, is_sup]
             datapoints.append({'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
-                               'max_context': max_context, 'feature_id': unique_id, 'example_id': example['id'],
+                'max_context': max_context, 'feature_id': unique_id, 'example_id': example['id'], 'para': para_ids,
                                'labels': labels, 'seq_len': input_len})
             unique_id += 1
 
-    print(f"max chunks: {max_chunks}")
+    print(f"max chunks: {max_chunks}, sup chunks: {sup_chunks}, avg num of sup chunks: {sup_chunks / span_ex_count}")
     print(f"yes_no: {yes_no_count}, span: {span_count}, same span (span with no answer): {same_span_count}, "
           f"total: {total_count}")
     print(f"yes_no: {yes_no_count / total_count:.5f}, span: {span_count / total_count:.5f}")
@@ -506,6 +550,9 @@ def build_features(config, examples, split, out_file):
     print(f"Examples in 10 chunks: {ten_chunks}, total examples: {len(examples)}")
     print(f"Examples with questions longer than {config.max_query_length} tokens: {cropped_questions}")
 
+    print(f'rank quantiles: 50%: {np.quantile(ranks, 0.5)}, 75%: {np.quantile(ranks, 0.75)}, '
+          f'90%: {np.quantile(ranks, 0.9)}, 95%: {np.quantile(ranks, 0.95)}, '
+          f'99%: {np.quantile(ranks, 0.99)}, 99.9%: {np.quantile(ranks, 0.999)}')
     dir_name = split
     try:
         os.mkdir(dir_name)
@@ -530,26 +577,30 @@ def build_features(config, examples, split, out_file):
     examples_total = 0
     for i in range(num_files - 1):
         with jsonlines.open(f'{dir_name}/{name}_{str(i)}.{ext}', mode='w') as writer:
-            examples = write_datapoints(datapoints[st: (i + 1) * batch_size], writer)
-            last_ex_id = datapoints[(i + 1) * batch_size - 1]['example_id']
-            j = (i + 1) * batch_size
-            is_y_n = datapoints[j]['labels'][0]
-            while datapoints[j]['example_id'] == last_ex_id:
-                writer.write(datapoints[j])
-                j += 1
-            if is_y_n:
-                examples.append((start, j - st))
-            st = j
+            end = (i + 1) * batch_size
+            examples, start = write_datapoints(datapoints[st: end], writer)
+            last_ex_id = datapoints[end - 1]['example_id']
+            is_y_n = datapoints[end]['labels'][0]
+            while datapoints[end]['example_id'] == last_ex_id:
+                writer.write(datapoints[end])
+                end += 1
+
+            #if is_y_n:
+            #    examples.append((start, j - st))
+            examples.append((start, end - st))
+            st = end
+
         examples_total += len(examples)
         with open(f'{dir_name}/{name}_{str(i)}_meta.pickle', mode='wb') as fp:
             pickle.dump(examples, fp)
 
     with jsonlines.open(f'{dir_name}/{name}_{str(num_files - 1)}.{ext}', mode='w') as writer:
-        examples = write_datapoints(datapoints[st:], writer)
+        examples, start = write_datapoints(datapoints[st:], writer)
         end = len(datapoints) - st - 1
         is_y_n = datapoints[end]['labels'][0]
-        if is_y_n:
-            examples.append((start, end))
+        #if is_y_n:
+        #    examples.append((start, end))
+        examples.append((start, end))
     examples_total += len(examples)
     print(f'EXAMPLES IN THE DATASET: {examples_total}')
     with open(f'{dir_name}/{name}_{str(num_files - 1)}_meta.pickle', mode='wb') as fp:
