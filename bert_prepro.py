@@ -1,6 +1,5 @@
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-
 import csv
 import random
 from tqdm import tqdm
@@ -14,16 +13,18 @@ from joblib import Parallel, delayed
 import bisect
 import re
 import string
-from transformers import BertTokenizer
+from transformers import BertTokenizer, T5Tokenizer
 import shutil
 import numpy as np
+import pandas as pd
+
 from gensim import corpora
 from gensim.summarization import bm25
 
 N_ARTICLES = 10
 BERT_MAX_SEQ_LEN = 512
-tokenizer = BertTokenizer.from_pretrained('bert-large-cased', return_token_type_ids=True)
-
+bert_tokenizer = BertTokenizer.from_pretrained('bert-base-cased', return_token_type_ids=True)
+t5_tokenizer = T5Tokenizer.from_pretrained('t5-base')
 
 def print_chunks(chunks):
     """
@@ -152,6 +153,7 @@ def preprocess(sent):
     """
     whitespaces = re.compile(r"\s+")
     sent = whitespaces.sub(" ", sent)
+    sent = sent.replace("\xad", "")
     return sent.encode('latin-1', 'ignore').decode('latin-1')
 
 
@@ -224,12 +226,6 @@ def _process_article(article):
         N_chars += 1
 
     question = preprocess(article['question'])
-    texts = [para.split() for para in para_context_text]
-    dictionary = corpora.Dictionary(texts)
-    corpus = [dictionary.doc2bow(text) for text in texts]
-    bm25_obj = bm25.BM25(corpus)
-    query_doc = dictionary.doc2bow(question.split())
-    scores = bm25_obj.get_scores(query_doc)
 
     full_text = ''.join(para_context_text)
 
@@ -260,10 +256,11 @@ def _process_article(article):
 
     example = {'question_tokens': question_tokens, 'context_tokens': para_context_tokens,
                's': best_indices[0], 'e': best_indices[1], 'id': article['_id'],
-               'start_end_facts': start_end_facts, 'sup_paragraphs': sup_paragraphs, 'bm25_scores': scores,
+               'start_end_facts': start_end_facts, 'sup_paragraphs': sup_paragraphs, #'bm25_scores': scores,
                'is_yes_no': is_yes_no, 'yes_no': yes_no}
     eval_example = {'context': full_text, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
-    return example, eval_example
+    ranking = {'id': article['_id'], 'paras' : para_context_text, 'question': question, 'lbls': sup_paragraphs}
+    return example, eval_example, ranking
 
 
 def process_file(filename, config):
@@ -281,13 +278,12 @@ def process_file(filename, config):
         _, ids_to_filter = zip(*list(reader))
     print(f'ids to filter: {ids_to_filter[1:5]}')
     outputs = Parallel(n_jobs=12, verbose=10)(delayed(_process_article)(article) for article in data if article['_id'] not in ids_to_filter)
-    examples = [e[0] for e in outputs]
-    eval_examples = [e[1] for e in outputs]
+    examples, eval_examples, ranking_examples = zip(*outputs)
 
-    random.shuffle(examples)
+    random.shuffle(list(examples))
     print(f"{len(examples)} questions in total")
 
-    return examples, eval_examples
+    return examples, eval_examples, ranking_examples
 
 
 def _check_is_max_context(doc_spans, cur_span_index, position):
@@ -395,7 +391,6 @@ def build_features(config, examples, split, out_file):
     cropped_questions = 0
 
     n_examples = len(examples)
-    ranks = np.zeros(n_examples, dtype=int)
 
     for i, example in enumerate(tqdm(examples)):
         question_tokens = example['question_tokens']
@@ -416,12 +411,8 @@ def build_features(config, examples, split, out_file):
         _DocSpan = collections.namedtuple(
             'DocSpan', ['para', 'start', 'length'])
         doc_spans = []
-        para_ids = []
         sup_paras = np.array(example["sup_paragraphs"])
-        scores = example["bm25_scores"]
-        sorted_idx = np.argsort(-np.array(scores))
-        ranks[i] = np.argmax(sup_paras[sorted_idx] * np.arange(1, len(sup_paras) + 1))
-
+        
         assert sum(sup_paras) == 2, 'wrong number of supportive facts'
 
         for para_i, para_tokens in enumerate(context_tokens):
@@ -499,7 +490,6 @@ def build_features(config, examples, split, out_file):
             doc_start = doc_span.start
             doc_end = doc_span.start + doc_span.length - 1
 
-            para_ids.append(doc_span.para)
             is_sup = int(sup_paras[doc_span.para])
             sup_chunks += is_sup
 
@@ -534,7 +524,7 @@ def build_features(config, examples, split, out_file):
                 total_count += 1
             labels = [is_yes_no, yes_no, span_s, span_e, is_sup]
             datapoints.append({'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
-                'max_context': max_context, 'feature_id': unique_id, 'example_id': example['id'], 'para': para_ids,
+                'max_context': max_context, 'feature_id': unique_id, 'example_id': example['id'], 'para': doc_span.para,
                                'labels': labels, 'seq_len': input_len})
             unique_id += 1
 
@@ -550,9 +540,6 @@ def build_features(config, examples, split, out_file):
     print(f"Examples in 10 chunks: {ten_chunks}, total examples: {len(examples)}")
     print(f"Examples with questions longer than {config.max_query_length} tokens: {cropped_questions}")
 
-    print(f'rank quantiles: 50%: {np.quantile(ranks, 0.5)}, 75%: {np.quantile(ranks, 0.75)}, '
-          f'90%: {np.quantile(ranks, 0.9)}, 95%: {np.quantile(ranks, 0.95)}, '
-          f'99%: {np.quantile(ranks, 0.99)}, 99.9%: {np.quantile(ranks, 0.999)}')
     dir_name = split
     try:
         os.mkdir(dir_name)
@@ -620,27 +607,26 @@ def prepro(config):
     :param config: config class
     """
     random.seed(13)
-    examples, eval_examples = process_file(config.data_file, config)
+    examples, eval_examples, ranking_examples = process_file(config.data_file, config)
 
     test_example = eval_examples[0]
     test_spans = test_example['spans']
-    print('SPAN EXAMPLES:')
-    for i in range(10):
-        idx = np.random.randint(len(test_spans))
-        span = test_spans[idx]
-        print(test_example['context'][span[0]: span[1]])
 
     print(len(examples), len(eval_examples))
     if config.data_split == 'train':
         record_file = config.train_record_file
         eval_file = config.train_eval_file
+        ranking_file = config.train_ranking_file
     elif config.data_split == 'dev':
         record_file = config.dev_record_file
         eval_file = config.dev_eval_file
+        ranking_file = config.dev_ranking_file
     elif config.data_split == 'test':
         record_file = config.test_record_file
         eval_file = config.test_eval_file
+        ranking_file = config.test_ranking_file
 
     build_features(config, examples, config.data_split, record_file)
     save(eval_file, eval_examples, message='{} eval'.format(config.data_split))
+    save(ranking_file, ranking_examples, message='{} ranking'.format(config.data_split))
 
