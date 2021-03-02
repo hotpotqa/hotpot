@@ -16,15 +16,13 @@ import string
 from transformers import BertTokenizer, T5Tokenizer
 import shutil
 import numpy as np
-import pandas as pd
-
-from gensim import corpora
-from gensim.summarization import bm25
 
 N_ARTICLES = 10
 BERT_MAX_SEQ_LEN = 512
 bert_tokenizer = BertTokenizer.from_pretrained('bert-base-cased', return_token_type_ids=True)
 t5_tokenizer = T5Tokenizer.from_pretrained('t5-base')
+tokenizer = 'placeholder'
+
 
 def print_chunks(chunks):
     """
@@ -97,7 +95,7 @@ def fix_span(text_context, offsets, span):
     return best_indices, best_dist
 
 
-def convert_idx(text, tokens, filter=lambda x: x):
+def convert_idx(text, tokens):
     """
     finds spans for each token in the text
     :param text: (str) context to look for token in
@@ -107,23 +105,15 @@ def convert_idx(text, tokens, filter=lambda x: x):
     """
     current = 0
     spans = []
+    is_bert = tokenizer == bert_tokenizer
     for token in tokens:
-        clear_token = filter(token)
+        clear_token = filter_func(tokenizer.convert_tokens_to_string([token]))
         current = text.find(clear_token, current)
-
-        assert current >= 0, f'token: {token}, cleared token: {clear_token}, text: {text}'
-
+        if is_bert:
+            assert current >= 0, f'token: {token}, cleared token: {clear_token}, text: {text}'
         spans.append((current, current + len(clear_token)))
         current += len(clear_token)
     return spans
-
-
-def tokenize(sent):
-    """
-    :param sent: (str) sentence in natural language
-    :return: (list of str) list of tokens
-    """
-    return tokenizer.tokenize(sent)
 
 
 def filter_func(token):
@@ -133,8 +123,10 @@ def filter_func(token):
     """
     if token == '[UNK]':
         token = ''
-    symbols = '#' #chars that need to be filtered out (e. g. '#' for BERT-like tokenization)
-    return token.lstrip(symbols)
+    symbols = ['\u2581', '#'] #chars that need to be filtered out (e. g. '#' for BERT-like tokenization)
+    for symbol in symbols:
+        token = token.lstrip(symbol)
+    return token
 
 
 def remove_punctuation(sent):
@@ -155,17 +147,6 @@ def preprocess(sent):
     sent = whitespaces.sub(" ", sent)
     sent = sent.replace("\xad", "")
     return sent.encode('latin-1', 'ignore').decode('latin-1')
-
-
-def encode(question, context, max_length):
-    """
-    :param question: (str) question in nl
-    :param context: (str) the whole context concatenated
-    :return: BERT-like tokenization (with special tokens: [CLS] question [SEP] context [SEP])
-    """
-    encoding = tokenizer.encode_plus(question, context, padding='max_length',
-                                     max_length=max_length,  truncation='only_second')
-    return encoding["input_ids"], encoding["attention_mask"], encoding["token_type_ids"]
 
 
 def _process_article(article):
@@ -193,12 +174,12 @@ def _process_article(article):
     def _process(sent, is_sup_fact=False):
         sent = preprocess(sent)
         nonlocal context_text, context_tokens, flat_offsets, start_end_facts, N_tokens, N_chars
-        sent_tokens = tokenize(sent)
-        sent_spans = convert_idx(sent, sent_tokens, filter_func)
+        sent_tokens = tokenizer.tokenize(sent)
+        sent_spans = convert_idx(sent, sent_tokens)
         sent_spans = [[N_chars+e[0], N_chars+e[1]] for e in sent_spans]
+        flat_offsets.extend(sent_spans)
         context_text += sent
         context_tokens.extend(sent_tokens)
-        flat_offsets.extend(sent_spans)
         N_chars += len(sent)
         sent_N_tokens = len(sent_tokens)
         start_end_facts.append((N_tokens, N_tokens + sent_N_tokens, is_sup_fact))
@@ -252,11 +233,11 @@ def _process_article(article):
 
     assert 2 <= sum(sup_paragraphs) <= 2, f'wrong number of sup paragraphs: {sum(sup_paragraphs)}'
 
-    question_tokens = tokenize(question)
+    question_tokens = tokenizer.tokenize(question)
 
     example = {'question_tokens': question_tokens, 'context_tokens': para_context_tokens,
                's': best_indices[0], 'e': best_indices[1], 'id': article['_id'],
-               'start_end_facts': start_end_facts, 'sup_paragraphs': sup_paragraphs, #'bm25_scores': scores,
+               'start_end_facts': start_end_facts, 'sup_paragraphs': sup_paragraphs,
                'is_yes_no': is_yes_no, 'yes_no': yes_no}
     eval_example = {'context': full_text, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
     ranking = {'id': article['_id'], 'paras' : para_context_text, 'question': question, 'lbls': sup_paragraphs}
@@ -277,7 +258,7 @@ def process_file(filename, config):
         reader = csv.reader(f)
         _, ids_to_filter = zip(*list(reader))
     print(f'ids to filter: {ids_to_filter[1:5]}')
-    outputs = Parallel(n_jobs=12, verbose=10)(delayed(_process_article)(article) for article in data if article['_id'] not in ids_to_filter)
+    outputs = Parallel(n_jobs=12, verbose=10, require='sharedmem')(delayed(_process_article)(article) for article in data if article['_id'] not in ids_to_filter)
     examples, eval_examples, ranking_examples = zip(*outputs)
 
     random.shuffle(list(examples))
@@ -330,6 +311,50 @@ def _check_is_max_context(doc_spans, cur_span_index, position):
     return cur_span_index == best_span_index
 
 
+def dump_dp(config, datapoints, dir_name, out_file):
+    """
+    dividing datapoints into multiple files for using lazy data loading with multiple workers
+    files are supposed to be of approximately equal size, but we do not want to split examples between files
+    :param config: config class
+    :param datapoints: List[Dict] a batch of data points
+    :param out_file: dumping file main part, data will be dumped to {out_file_name}_{file_num}.{out_file_ext}
+    """
+
+    fileparts = out_file.split('.')
+    name, ext = '.'.join(fileparts[:-1]), fileparts[-1]
+
+    num_objects = len(datapoints)
+    num_files = config.num_files if config.num_files > 0 else num_objects
+    batch_size = num_objects // num_files
+
+    st = 0
+    examples_total = 0
+    for i in range(num_files - 1):
+        with jsonlines.open(f'{dir_name}/{name}_{i}.{ext}', mode='w') as writer:
+            end = (i + 1) * batch_size
+            examples, start = write_datapoints(datapoints[st: end], writer)
+            last_ex_id = datapoints[end - 1]['example_id']
+
+            while datapoints[end]['example_id'] == last_ex_id:
+                writer.write(datapoints[end])
+                end += 1
+            examples.append((start, end - st))
+            st = end
+
+        examples_total += len(examples)
+        with open(f'{dir_name}/{name}_{str(i)}_meta.pickle', mode='wb') as fp:
+            pickle.dump(examples, fp)
+
+    with jsonlines.open(f'{dir_name}/{name}_{num_files - 1}.{ext}', mode='w') as writer:
+        examples, start = write_datapoints(datapoints[st:], writer)
+        end = len(datapoints)
+        examples.append((start, end - st))
+    examples_total += len(examples)
+    with open(f'{dir_name}/{name}_{num_files - 1}_meta.pickle', mode='wb') as fp:
+        pickle.dump(examples, fp)
+    return examples_total
+
+
 def write_datapoints(datapoints, writer):
     """
     write datapoints to a file, remember the beginning and ending lines for the yes/no questions
@@ -354,6 +379,92 @@ def write_datapoints(datapoints, writer):
     return examples, start
 
 
+def build_bert_datapoint(config,
+                         question_tokens, context_tokens,
+                         doc_spans, doc_span_index):
+
+    doc_span = doc_spans[doc_span_index]
+    tokens = []
+    segment_ids = []
+    max_context = []
+
+    tokens.append("[CLS]")
+    segment_ids.append(0)
+    max_context.append(0)
+
+    tokens.extend(question_tokens)
+    segment_ids.extend([0] * len(question_tokens))
+    max_context.extend([0] * len(question_tokens))
+
+    tokens.append("[SEP]")
+    segment_ids.append(0)
+    max_context.append(0)
+
+    for i in range(doc_span.length):
+        split_token_index = doc_span.start + i
+        max_context.append(int(_check_is_max_context(doc_spans, doc_span_index,
+                                                     split_token_index)))
+        tokens.append(context_tokens[doc_span.para][split_token_index])
+        segment_ids.append(1)
+
+    tokens.append("[SEP]")
+    segment_ids.append(1)
+    max_context.append(0)
+
+    input_ids = tokenizer.convert_tokens_to_ids(tokens)
+    input_mask = [1] * len(input_ids)
+
+    input_len = len(input_ids)
+    pad_len = config.max_seq_length - input_len
+    pad = [0] * pad_len
+
+    input_ids.extend(pad)
+    input_mask.extend(pad)
+    segment_ids.extend(pad)
+    max_context.extend(pad)
+
+    assert len(input_ids) == config.max_seq_length
+    assert len(input_mask) == config.max_seq_length
+    assert len(segment_ids) == config.max_seq_length
+    assert len(max_context) == config.max_seq_length
+
+    datapoint = {'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
+                 'max_context': max_context, 'seq_len': input_len}
+    return datapoint
+
+
+def build_t5_datapoint(config,
+                       question_tokens, context_tokens,
+                       doc_spans, doc_span_index):
+
+    doc_span = doc_spans[doc_span_index]
+    tokens = []
+
+    tokens.append('Query:')
+    tokens.extend(question_tokens)
+    tokens.append('Document:')
+    split_token_index = doc_span.start
+    tokens.extend(context_tokens[doc_span.para][split_token_index: split_token_index + doc_span.length])
+    tokens.append('Relevant:')
+
+    input_ids = tokenizer.convert_tokens_to_ids(tokens)
+    input_mask = [1] * len(input_ids)
+
+    input_len = len(input_ids)
+    pad_len = config.max_seq_length - input_len
+    pad = [0] * pad_len
+
+    input_ids.extend(pad)
+    input_mask.extend(pad)
+
+    assert len(input_ids) == config.max_seq_length
+    assert len(input_mask) == config.max_seq_length
+
+    datapoint = {'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': [0] * config.max_seq_length,
+            'max_context': [0] * config.max_seq_length, 'seq_len': input_len}
+    return datapoint
+
+
 def build_features(config, examples, split, out_file):
     """
     make chunks of size config.max_seq_length to train a BERT-like model
@@ -370,40 +481,30 @@ def build_features(config, examples, split, out_file):
 
     unique_id = 0
 
-    yes_no_count = 0
-    span_count = 0
-    same_span_count = 0
-    total_count = 0
+    yes_no_count, span_count , total_count = 0, 0, 0
 
     yes_no_ex_count = 0
     span_ex_count = 0
     max_chunks = 0
-
-    #EDA
-    whole_span = 0
-    part_span = 0
-    whole_sup = 0
-    part_sup = 0
-
     sup_chunks = 0
-
     ten_chunks = 0
     cropped_questions = 0
 
-    n_examples = len(examples)
-
+    start_token, sep_token, end_token = ('[CLS]', '[SEP]', '[SEP]') if config.tokenizer == 'bert'\
+        else ('Question:', 'Document:', 'Relevant:')
+    is_relevant_labels = ['false', 'true']
     for i, example in enumerate(tqdm(examples)):
         question_tokens = example['question_tokens']
         context_tokens = example['context_tokens']
         if len(question_tokens) > config.max_query_length:
             question_tokens = question_tokens[0: config.max_query_length]
             cropped_questions += 1
-        question_shift = len(question_tokens) + 2  # [CLS] + question + [SEP]
+        question_shift = len(question_tokens) + len(tokenizer.tokenize(start_token)) + \
+                         len(tokenizer.tokenize(sep_token))
         # answer span is based on context_text tokens only but after encoding
-        #  question and special tokens are added in front
+        # question and special tokens are added in front
 
-        # The -1 accounts for [SEP] after context
-        max_tokens_for_seq = config.max_seq_length - question_shift - 1
+        max_tokens_for_seq = config.max_seq_length - question_shift - len(tokenizer.tokenize(end_token))
 
         if config.is_training:
             start, end = example['s'], example['e']
@@ -426,121 +527,64 @@ def build_features(config, examples, split, out_file):
 
             doc_spans.append(_DocSpan(para_i, start=start_offset, length=length))
 
-
         num_chunks = len(doc_spans)
-        if num_chunks == 10:
-            ten_chunks += 1
+
+        ten_chunks += int(num_chunks == 10)
 
         is_yes_no_example = example['is_yes_no']
-        yes_no_example = example['yes_no']
+        is_yes_example = example['yes_no']
 
         if is_yes_no_example:
             yes_no_example_id_to_ans[example['id']] = example['yes_no']
         yes_no_ex_count += is_yes_no_example
         span_ex_count += 1 - is_yes_no_example
-
         supportive_facts = example['start_end_facts']
         max_chunks = max(max_chunks, num_chunks)
 
-        for (doc_span_index, doc_span) in enumerate(doc_spans):
-            tokens = []
-            segment_ids = []
-            max_context = []
-
-            tokens.append("[CLS]")
-            segment_ids.append(0)
-            max_context.append(0)
-
-            tokens.extend(question_tokens)
-            segment_ids.extend([0] * len(question_tokens))
-            max_context.extend([0] * len(question_tokens))
-
-            tokens.append("[SEP]")
-            segment_ids.append(0)
-            max_context.append(0)
-
-            for i in range(doc_span.length):
-                split_token_index = doc_span.start + i
-
-                max_context.append(int(_check_is_max_context(doc_spans, doc_span_index,
-                                                       split_token_index)))
-                tokens.append(context_tokens[doc_span.para][split_token_index])
-                segment_ids.append(1)
-            tokens.append("[SEP]")
-            segment_ids.append(1)
-            max_context.append(0)
-
-            input_ids = tokenizer.convert_tokens_to_ids(tokens)
-            input_mask = [1] * len(input_ids)
-
-            input_len = len(input_ids)
-            pad_len = config.max_seq_length - input_len
-            pad = [0] * pad_len
-
-            input_ids.extend(pad)
-            input_mask.extend(pad)
-            segment_ids.extend(pad)
-            max_context.extend(pad)
-
-            assert len(input_ids) == config.max_seq_length
-            assert len(input_mask) == config.max_seq_length
-            assert len(segment_ids) == config.max_seq_length
-            assert len(max_context) == config.max_seq_length
+        for doc_span_index, doc_span in enumerate(doc_spans):
 
             doc_start = doc_span.start
             doc_end = doc_span.start + doc_span.length - 1
 
-            is_sup = int(sup_paras[doc_span.para])
-            sup_chunks += is_sup
+            is_sup_binary = int(sup_paras[doc_span.para])
+            is_sup = is_sup_binary if config.tokenizer == 'bert' else tokenizer.encode(is_relevant_labels[is_sup_binary])[0]
+            sup_chunks += is_sup_binary
 
             span_s, span_e = 0, 0
             is_yes_no = is_yes_no_example
             # yes -- 1, no -- 0
-            yes_no = -1
+            is_yes = -1
             if is_yes_no:
-                yes_no = yes_no_example
+                is_yes = is_yes_example
 
-            if config.is_training:
-                if start >= doc_start and end <= doc_end:
-                    whole_span += 1
-                    span_s = start - doc_start + question_shift
-                    span_e = end - doc_start + question_shift
-                    assert 0 <= span_s < config.max_seq_length, f'starts are wrong, {span_s}'
-                    assert 0 <= span_e < config.max_seq_length, f'ends are wrong, {span_e}'
-                elif doc_start <= start <= doc_end or doc_start <= end <= doc_end:
-                    part_span += 1
-                    same_span_count += (1 - is_yes_no)
-                else:
-                    same_span_count += (1 - is_yes_no)
+            if config.is_training and start >= doc_start and end <= doc_end:
+                span_s = start - doc_start + question_shift
+                span_e = end - doc_start + question_shift
+                assert 0 <= span_s < config.max_seq_length, f'starts are wrong, {span_s}'
+                assert 0 <= span_e < config.max_seq_length, f'ends are wrong, {span_e}'
 
-                for s, e, sup in supportive_facts:
-                    if sup and (s >= doc_start and e <= doc_end):
-                        whole_sup += 1
-                    elif sup and (doc_start <= s <= doc_end or doc_start <= e <= doc_end):
-                        part_sup += 1
+            labels = [is_yes_no, is_yes, span_s, span_e, is_sup]
 
-                yes_no_count += is_yes_no
-                span_count += (1 - is_yes_no)
-                total_count += 1
-            labels = [is_yes_no, yes_no, span_s, span_e, is_sup]
-            datapoints.append({'input_ids': input_ids, 'attention_mask': input_mask, 'token_type_ids': segment_ids,
-                'max_context': max_context, 'feature_id': unique_id, 'example_id': example['id'], 'para': doc_span.para,
-                               'labels': labels, 'seq_len': input_len})
+            yes_no_count += is_yes_no
+            span_count += (1 - is_yes_no)
+            total_count += 1
             unique_id += 1
 
+            dp = build_bert_datapoint(config, question_tokens, context_tokens, doc_spans, doc_span_index)\
+                if config.tokenizer == 'bert' else \
+                build_t5_datapoint(config, question_tokens, context_tokens, doc_spans, doc_span_index)
+            dp.update({'feature_id': unique_id, 'example_id': example['id'], 'para': doc_span.para, 'labels': labels})
+            datapoints.append(dp)
+
     print(f"max chunks: {max_chunks}, sup chunks: {sup_chunks}, avg num of sup chunks: {sup_chunks / span_ex_count}")
-    print(f"yes_no: {yes_no_count}, span: {span_count}, same span (span with no answer): {same_span_count}, "
-          f"total: {total_count}")
+    print(f"yes_no: {yes_no_count}, span: {span_count}, total: {total_count}")
     print(f"yes_no: {yes_no_count / total_count:.5f}, span: {span_count / total_count:.5f}")
     print(f"yes_no_examples: {yes_no_ex_count}, span: {span_ex_count}")
-    print(f"whole span chunks ratio: {whole_span / span_count:.5f}")
-    print(f"whole supportive fact chunks ratio: {whole_sup / total_count:.5f}")
-    print(f"partial span chunks ratio: {part_span / span_count:5f}")
-    print(f"partial supportive fact chunks ratio: {part_sup / total_count:.5f}")
     print(f"Examples in 10 chunks: {ten_chunks}, total examples: {len(examples)}")
     print(f"Examples with questions longer than {config.max_query_length} tokens: {cropped_questions}")
 
     dir_name = split
+
     try:
         os.mkdir(dir_name)
         print(f"Directory {dir_name} created")
@@ -552,46 +596,9 @@ def build_features(config, examples, split, out_file):
     with open(f'{dir_name}/{config.yes_no_example_file}', "wb") as fp:
         pickle.dump([yes_no_example_id_to_ans], fp)
 
-    fileparts = out_file.split('.')
-    name, ext = '.'.join(fileparts[:-1]), fileparts[-1]
-    num_objects = len(datapoints)
-    num_files = config.num_files if config.num_files > 0 else num_objects
-    batch_size = num_objects // num_files
-    st = 0
-    # dividing datapoints into multiple files for using lazy data loading with multiple workers
-    # files are supposed to be of approximately equal size, but we do not want to split examples between files
-
-    examples_total = 0
-    for i in range(num_files - 1):
-        with jsonlines.open(f'{dir_name}/{name}_{str(i)}.{ext}', mode='w') as writer:
-            end = (i + 1) * batch_size
-            examples, start = write_datapoints(datapoints[st: end], writer)
-            last_ex_id = datapoints[end - 1]['example_id']
-            is_y_n = datapoints[end]['labels'][0]
-            while datapoints[end]['example_id'] == last_ex_id:
-                writer.write(datapoints[end])
-                end += 1
-
-            #if is_y_n:
-            #    examples.append((start, j - st))
-            examples.append((start, end - st))
-            st = end
-
-        examples_total += len(examples)
-        with open(f'{dir_name}/{name}_{str(i)}_meta.pickle', mode='wb') as fp:
-            pickle.dump(examples, fp)
-
-    with jsonlines.open(f'{dir_name}/{name}_{str(num_files - 1)}.{ext}', mode='w') as writer:
-        examples, start = write_datapoints(datapoints[st:], writer)
-        end = len(datapoints) - st - 1
-        is_y_n = datapoints[end]['labels'][0]
-        #if is_y_n:
-        #    examples.append((start, end))
-        examples.append((start, end))
-    examples_total += len(examples)
-    print(f'EXAMPLES IN THE DATASET: {examples_total}')
-    with open(f'{dir_name}/{name}_{str(num_files - 1)}_meta.pickle', mode='wb') as fp:
-        pickle.dump(examples, fp)
+    dumped = dump_dp(config, datapoints, dir_name, out_file)
+    assert dumped == len(examples), f'number of examples dumped ({dumped}) is not equal to' \
+                                    f' total number of examples: {len(examples)}'
 
 
 def save(filename, obj, message=None):
@@ -607,8 +614,9 @@ def prepro(config):
     :param config: config class
     """
     random.seed(13)
+    global tokenizer
+    tokenizer = bert_tokenizer if config.tokenizer == 'bert' else t5_tokenizer
     examples, eval_examples, ranking_examples = process_file(config.data_file, config)
-
     test_example = eval_examples[0]
     test_spans = test_example['spans']
 
