@@ -365,16 +365,12 @@ def write_datapoints(datapoints, writer):
     examples = []  # holds beginning and ending lines of each example in the respective file
     start = 0
     ex_id = None
-    is_y_n = False
     for dp_idx, datapoint in enumerate(datapoints):
-        if ex_id and datapoint['example_id'] != ex_id:
+        if ex_id is not None and datapoint['example_id'] != ex_id:
             end = dp_idx
-            #if is_y_n:
-            #    examples.append((start, end))
             examples.append((start, end))
             start = end
         ex_id = datapoint['example_id']
-        is_y_n = datapoint['labels'][0]
         writer.write(datapoint)
     return examples, start
 
@@ -440,12 +436,12 @@ def build_t5_datapoint(config,
     doc_span = doc_spans[doc_span_index]
     tokens = []
 
-    tokens.append('Query:')
+    tokens.append(tokenizer.tokenize('Query:')[0])
     tokens.extend(question_tokens)
-    tokens.append('Document:')
+    tokens.append(tokenizer.tokenize('Document:')[0])
     split_token_index = doc_span.start
     tokens.extend(context_tokens[doc_span.para][split_token_index: split_token_index + doc_span.length])
-    tokens.append('Relevant:')
+    tokens.append(tokenizer.tokenize('Relevant:')[0])
 
     input_ids = tokenizer.convert_tokens_to_ids(tokens)
     input_mask = [1] * len(input_ids)
@@ -477,6 +473,7 @@ def build_features(config, examples, split, out_file):
     """
     print(f"Processing {split} examples...")
     datapoints = []
+    chunk_lens = []
     yes_no_example_id_to_ans = {}
 
     unique_id = 0
@@ -530,6 +527,7 @@ def build_features(config, examples, split, out_file):
         num_chunks = len(doc_spans)
 
         ten_chunks += int(num_chunks == 10)
+        chunk_lens.append(num_chunks)
 
         is_yes_no_example = example['is_yes_no']
         is_yes_example = example['yes_no']
@@ -576,12 +574,14 @@ def build_features(config, examples, split, out_file):
             dp.update({'feature_id': unique_id, 'example_id': example['id'], 'para': doc_span.para, 'labels': labels})
             datapoints.append(dp)
 
+    chunk_lens = np.array(chunk_lens)
     print(f"max chunks: {max_chunks}, sup chunks: {sup_chunks}, avg num of sup chunks: {sup_chunks / span_ex_count}")
     print(f"yes_no: {yes_no_count}, span: {span_count}, total: {total_count}")
     print(f"yes_no: {yes_no_count / total_count:.5f}, span: {span_count / total_count:.5f}")
     print(f"yes_no_examples: {yes_no_ex_count}, span: {span_ex_count}")
     print(f"Examples in 10 chunks: {ten_chunks}, total examples: {len(examples)}")
     print(f"Examples with questions longer than {config.max_query_length} tokens: {cropped_questions}")
+    print(f"Chunk lens: {np.quantile(chunk_lens, q=0.5)}, {np.quantile(chunk_lens, q=0.75)}, {np.quantile(chunk_lens, q=0.9)}, {np.quantile(chunk_lens, q=0.95)}, {np.quantile(chunk_lens, q=0.99)}")
 
     dir_name = split
 
@@ -597,6 +597,8 @@ def build_features(config, examples, split, out_file):
         pickle.dump([yes_no_example_id_to_ans], fp)
 
     dumped = dump_dp(config, datapoints, dir_name, out_file)
+    for example in dumped:
+        assert (example[1] - example[0]) < 25, print(example[1] - example[0])  
     assert dumped == len(examples), f'number of examples dumped ({dumped}) is not equal to' \
                                     f' total number of examples: {len(examples)}'
 
