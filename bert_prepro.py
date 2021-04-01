@@ -169,6 +169,7 @@ def _process_article(article):
     sup_paragraphs = [0] * len(paragraphs) # 1 if paragraph contains supportive fact, else 0
     para_context_text = []
     para_context_tokens = []
+    para_start_end_facts = []
     N_tokens, N_chars = 0, 0
 
     def _process(sent, is_sup_fact=False):
@@ -202,8 +203,10 @@ def _process_article(article):
             _process(sent, is_sup_fact)
         para_context_text.append(context_text)
         para_context_tokens.append(context_tokens)
+        para_start_end_facts.append(start_end_facts)
         context_text = "\n"
         context_tokens = []
+        start_end_facts = []
         N_chars += 1
 
     question = preprocess(article['question'])
@@ -237,7 +240,7 @@ def _process_article(article):
 
     example = {'question_tokens': question_tokens, 'context_tokens': para_context_tokens,
                's': best_indices[0], 'e': best_indices[1], 'id': article['_id'],
-               'start_end_facts': start_end_facts, 'sup_paragraphs': sup_paragraphs,
+               'start_end_facts': para_start_end_facts, 'sup_paragraphs': sup_paragraphs,
                'is_yes_no': is_yes_no, 'yes_no': yes_no}
     eval_example = {'context': full_text, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
     ranking = {'id': article['_id'], 'paras' : para_context_text, 'question': question, 'lbls': sup_paragraphs}
@@ -257,7 +260,6 @@ def process_file(filename, config):
     with open('filter_ids.csv', newline='') as f:
         reader = csv.reader(f)
         _, ids_to_filter = zip(*list(reader))
-    print(f'ids to filter: {ids_to_filter[1:5]}')
     outputs = Parallel(n_jobs=12, verbose=10, require='sharedmem')(delayed(_process_article)(article) for article in data if article['_id'] not in ids_to_filter)
     examples, eval_examples, ranking_examples = zip(*outputs)
 
@@ -493,6 +495,8 @@ def build_features(config, examples, split, out_file):
     for i, example in enumerate(tqdm(examples)):
         question_tokens = example['question_tokens']
         context_tokens = example['context_tokens']
+        start_end_facts = example['start_end_facts']
+        sup_labels = []
         if len(question_tokens) > config.max_query_length:
             question_tokens = question_tokens[0: config.max_query_length]
             cropped_questions += 1
@@ -513,17 +517,24 @@ def build_features(config, examples, split, out_file):
         
         assert sum(sup_paras) == 2, 'wrong number of supportive facts'
 
-        for para_i, para_tokens in enumerate(context_tokens):
-            start_offset = 0
-            length = len(para_tokens)
+        if context.level == 'paragraph':
+            for para_i, para_tokens in enumerate(context_tokens):
+                start_offset = 0
+                length = len(para_tokens)
 
-            while length > max_tokens_for_seq:
-                doc_spans.append(_DocSpan(para_i, start=start_offset, length=max_tokens_for_seq))
-                start_offset += config.doc_stride
-                length -= config.doc_stride
+                while length > max_tokens_for_seq:
+                    doc_spans.append(_DocSpan(para_i, start=start_offset, length=max_tokens_for_seq))
+                    start_offset += config.doc_stride
+                    length -= config.doc_stride
 
-            doc_spans.append(_DocSpan(para_i, start=start_offset, length=length))
-
+                doc_spans.append(_DocSpan(para_i, start=start_offset, length=length))
+        elif context.level == 'sentence':
+            for para_i, sent_spans in range(start_end_facts):
+                for el in sent_spans:
+                    s, e, is_sup_fact = el
+                    length = e - s
+                    sup_labels.append(is_sup_fact)
+                    doc_spans.append(_DocSpan(para_i, start=s, length=length))
         num_chunks = len(doc_spans)
 
         ten_chunks += int(num_chunks == 10)
@@ -536,7 +547,6 @@ def build_features(config, examples, split, out_file):
             yes_no_example_id_to_ans[example['id']] = example['yes_no']
         yes_no_ex_count += is_yes_no_example
         span_ex_count += 1 - is_yes_no_example
-        supportive_facts = example['start_end_facts']
         max_chunks = max(max_chunks, num_chunks)
 
         for doc_span_index, doc_span in enumerate(doc_spans):
@@ -544,7 +554,7 @@ def build_features(config, examples, split, out_file):
             doc_start = doc_span.start
             doc_end = doc_span.start + doc_span.length - 1
 
-            is_sup_binary = int(sup_paras[doc_span.para])
+            is_sup_binary = int(sup_paras[doc_span.para]) if config.level == 'paragraph' else sup_labels[doc_span_index]
             is_sup = is_sup_binary if config.tokenizer == 'bert' else tokenizer.encode(is_relevant_labels[is_sup_binary])[0]
             sup_chunks += is_sup_binary
 
@@ -581,7 +591,8 @@ def build_features(config, examples, split, out_file):
     print(f"yes_no_examples: {yes_no_ex_count}, span: {span_ex_count}")
     print(f"Examples in 10 chunks: {ten_chunks}, total examples: {len(examples)}")
     print(f"Examples with questions longer than {config.max_query_length} tokens: {cropped_questions}")
-    print(f"Chunk lens: {np.quantile(chunk_lens, q=0.5)}, {np.quantile(chunk_lens, q=0.75)}, {np.quantile(chunk_lens, q=0.9)}, {np.quantile(chunk_lens, q=0.95)}, {np.quantile(chunk_lens, q=0.99)}")
+    print(f"Chunk lens: {np.quantile(chunk_lens, q=0.5)}, {np.quantile(chunk_lens, q=0.75)}, {np.quantile(chunk_lens, q=0.9)},
+            {np.quantile(chunk_lens, q=0.95)}, {np.quantile(chunk_lens, q=0.99)}")
 
     dir_name = split
 
@@ -597,8 +608,6 @@ def build_features(config, examples, split, out_file):
         pickle.dump([yes_no_example_id_to_ans], fp)
 
     dumped = dump_dp(config, datapoints, dir_name, out_file)
-    for example in dumped:
-        assert (example[1] - example[0]) < 25, print(example[1] - example[0])  
     assert dumped == len(examples), f'number of examples dumped ({dumped}) is not equal to' \
                                     f' total number of examples: {len(examples)}'
 
@@ -616,6 +625,8 @@ def prepro(config):
     :param config: config class
     """
     random.seed(13)
+    # remove sample weights file
+    os.remove('/mnt/localdata/rak/kg_qa/models/SpanBERT/outputs/train_weights.pickle')
     global tokenizer
     tokenizer = bert_tokenizer if config.tokenizer == 'bert' else t5_tokenizer
     examples, eval_examples, ranking_examples = process_file(config.data_file, config)
