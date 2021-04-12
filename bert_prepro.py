@@ -16,6 +16,7 @@ import string
 from transformers import BertTokenizer, T5Tokenizer
 import shutil
 import numpy as np
+import matplotlib.pyplot as plt
 
 N_ARTICLES = 10
 BERT_MAX_SEQ_LEN = 512
@@ -208,6 +209,7 @@ def _process_article(article):
         context_tokens = []
         start_end_facts = []
         N_chars += 1
+        N_tokens = 0
 
     question = preprocess(article['question'])
 
@@ -243,8 +245,7 @@ def _process_article(article):
                'start_end_facts': para_start_end_facts, 'sup_paragraphs': sup_paragraphs,
                'is_yes_no': is_yes_no, 'yes_no': yes_no}
     eval_example = {'context': full_text, 'spans': flat_offsets, 'answer': answer, 'id': article['_id']}
-    ranking = {'id': article['_id'], 'paras' : para_context_text, 'question': question, 'lbls': sup_paragraphs}
-    return example, eval_example, ranking
+    return example, eval_example
 
 
 def process_file(filename, config):
@@ -260,13 +261,13 @@ def process_file(filename, config):
     with open('filter_ids.csv', newline='') as f:
         reader = csv.reader(f)
         _, ids_to_filter = zip(*list(reader))
-    outputs = Parallel(n_jobs=12, verbose=10, require='sharedmem')(delayed(_process_article)(article) for article in data if article['_id'] not in ids_to_filter)
-    examples, eval_examples, ranking_examples = zip(*outputs)
+    outputs = Parallel(n_jobs=8, verbose=10, require='sharedmem')(delayed(_process_article)(article) for article in data if article['_id'] not in ids_to_filter)
+    examples, eval_examples = zip(*outputs)
 
     random.shuffle(list(examples))
     print(f"{len(examples)} questions in total")
 
-    return examples, eval_examples, ranking_examples
+    return examples, eval_examples
 
 
 def _check_is_max_context(doc_spans, cur_span_index, position):
@@ -403,6 +404,11 @@ def build_bert_datapoint(config,
         max_context.append(int(_check_is_max_context(doc_spans, doc_span_index,
                                                      split_token_index)))
         tokens.append(context_tokens[doc_span.para][split_token_index])
+        #except:
+        #    print('EXCEPTION:')
+        #    print('span index:', i, 'start index:', doc_span.start, 'prev article len:', len(context_tokens[doc_span.para - 1]))
+        #    print('split token index:', split_token_index, f'len context_tokens[{doc_span.para}]', len(context_tokens[doc_span.para]))
+        #    return
         segment_ids.append(1)
 
     tokens.append("[SEP]")
@@ -421,7 +427,7 @@ def build_bert_datapoint(config,
     segment_ids.extend(pad)
     max_context.extend(pad)
 
-    assert len(input_ids) == config.max_seq_length
+    assert len(input_ids) == config.max_seq_length, len(input_ids)
     assert len(input_mask) == config.max_seq_length
     assert len(segment_ids) == config.max_seq_length
     assert len(max_context) == config.max_seq_length
@@ -476,6 +482,8 @@ def build_features(config, examples, split, out_file):
     print(f"Processing {split} examples...")
     datapoints = []
     chunk_lens = []
+    datapoint_lens = []
+    all_sup_labels = []
     yes_no_example_id_to_ans = {}
 
     unique_id = 0
@@ -487,7 +495,9 @@ def build_features(config, examples, split, out_file):
     max_chunks = 0
     sup_chunks = 0
     ten_chunks = 0
+
     cropped_questions = 0
+    cropped_sentences = 0
 
     start_token, sep_token, end_token = ('[CLS]', '[SEP]', '[SEP]') if config.tokenizer == 'bert'\
         else ('Question:', 'Document:', 'Relevant:')
@@ -517,7 +527,7 @@ def build_features(config, examples, split, out_file):
         
         assert sum(sup_paras) == 2, 'wrong number of supportive facts'
 
-        if context.level == 'paragraph':
+        if config.level == 'paragraph':
             for para_i, para_tokens in enumerate(context_tokens):
                 start_offset = 0
                 length = len(para_tokens)
@@ -526,15 +536,22 @@ def build_features(config, examples, split, out_file):
                     doc_spans.append(_DocSpan(para_i, start=start_offset, length=max_tokens_for_seq))
                     start_offset += config.doc_stride
                     length -= config.doc_stride
+                    datapoint_lens.append(max_tokens_for_seq)
 
                 doc_spans.append(_DocSpan(para_i, start=start_offset, length=length))
-        elif context.level == 'sentence':
-            for para_i, sent_spans in range(start_end_facts):
+                datapoint_lens.append(length)
+        elif config.level == 'sentence':
+            for para_i, sent_spans in enumerate(start_end_facts):
                 for el in sent_spans:
                     s, e, is_sup_fact = el
-                    length = e - s
+                    length = min(e - s, max_tokens_for_seq)
+                    if e - s > max_tokens_for_seq:
+                        cropped_sentences += 1
                     sup_labels.append(is_sup_fact)
                     doc_spans.append(_DocSpan(para_i, start=s, length=length))
+                    datapoint_lens.append(e-s)
+        else:
+            print(f'sorry, there is no such level {config.level}')
         num_chunks = len(doc_spans)
 
         ten_chunks += int(num_chunks == 10)
@@ -555,6 +572,7 @@ def build_features(config, examples, split, out_file):
             doc_end = doc_span.start + doc_span.length - 1
 
             is_sup_binary = int(sup_paras[doc_span.para]) if config.level == 'paragraph' else sup_labels[doc_span_index]
+            all_sup_labels.append(is_sup_binary)
             is_sup = is_sup_binary if config.tokenizer == 'bert' else tokenizer.encode(is_relevant_labels[is_sup_binary])[0]
             sup_chunks += is_sup_binary
 
@@ -585,16 +603,21 @@ def build_features(config, examples, split, out_file):
             datapoints.append(dp)
 
     chunk_lens = np.array(chunk_lens)
+    all_sup_labels = np.array(all_sup_labels)
+    datapoint_lens = np.array(datapoint_lens)
+    plot_stats(config, chunk_lens, datapoint_lens, all_sup_labels)
+    
+    assert len(datapoint_lens) == len(all_sup_labels), f'len of datapoints lens: {len(datapoints_lens)} does not match len of sup labels: {len(all_sup_labels)}'
     print(f"max chunks: {max_chunks}, sup chunks: {sup_chunks}, avg num of sup chunks: {sup_chunks / span_ex_count}")
     print(f"yes_no: {yes_no_count}, span: {span_count}, total: {total_count}")
     print(f"yes_no: {yes_no_count / total_count:.5f}, span: {span_count / total_count:.5f}")
     print(f"yes_no_examples: {yes_no_ex_count}, span: {span_ex_count}")
     print(f"Examples in 10 chunks: {ten_chunks}, total examples: {len(examples)}")
-    print(f"Examples with questions longer than {config.max_query_length} tokens: {cropped_questions}")
-    print(f"Chunk lens: {np.quantile(chunk_lens, q=0.5)}, {np.quantile(chunk_lens, q=0.75)}, {np.quantile(chunk_lens, q=0.9)},
+    print(f"Examples with questions longer than {config.max_query_length} tokens: {cropped_questions}, cropped sentences: {cropped_sentences}")
+    print(f"Chunk lens: {np.quantile(chunk_lens, q=0.5)}, {np.quantile(chunk_lens, q=0.75)}, {np.quantile(chunk_lens, q=0.9)}, \
             {np.quantile(chunk_lens, q=0.95)}, {np.quantile(chunk_lens, q=0.99)}")
 
-    dir_name = split
+    dir_name = f'{config.level}_{split}'
 
     try:
         os.mkdir(dir_name)
@@ -612,6 +635,32 @@ def build_features(config, examples, split, out_file):
                                     f' total number of examples: {len(examples)}'
 
 
+def plot_stats(config, chunk_lens, datapoint_lens, all_sup_labels):
+    fig, axs = plt.subplots(ncols=2, nrows=2, sharey='all')
+    axs = axs.flatten()
+    
+    for i in range(4):
+        axs[i].set_yscale('log')
+    shared_list = axs[1:]
+    shared_list[0].get_shared_x_axes().join(*shared_list)
+    name = 'Fact' if config.level == 'sentence' else 'Chunk'
+
+    axs[0].hist(chunk_lens)
+    axs[0].set_title(f'{name} number\n distribution\n')
+
+    axs[1].hist(datapoint_lens)
+    axs[1].set_title(f'{name} token number \n distribution\n')
+
+    axs[2].hist(datapoint_lens[all_sup_labels.astype(bool)])
+    axs[2].set_title(f'Supporting {name} token number \n distribution\n')
+
+    axs[3].hist(datapoint_lens[(1 - all_sup_labels).astype(bool)])
+    axs[3].set_title(f'Non-supporting {name} token number \n distribution\n')
+    fig.tight_layout()
+    plt.savefig(f'plots/{split}_{config.level}_eda.png')
+
+
+
 def save(filename, obj, message=None):
     if message is not None:
         print("Saving {}...".format(message))
@@ -626,10 +675,12 @@ def prepro(config):
     """
     random.seed(13)
     # remove sample weights file
-    os.remove('/mnt/localdata/rak/kg_qa/models/SpanBERT/outputs/train_weights.pickle')
+    weights_file = '/mnt/localdata/rak/kg_qa/models/SpanBERT/outputs/train_weights.pickle'
+    if os.path.exists(weights_file):
+        os.remove(weights_file)
     global tokenizer
     tokenizer = bert_tokenizer if config.tokenizer == 'bert' else t5_tokenizer
-    examples, eval_examples, ranking_examples = process_file(config.data_file, config)
+    examples, eval_examples = process_file(config.data_file, config)
     test_example = eval_examples[0]
     test_spans = test_example['spans']
 
@@ -637,17 +688,13 @@ def prepro(config):
     if config.data_split == 'train':
         record_file = config.train_record_file
         eval_file = config.train_eval_file
-        ranking_file = config.train_ranking_file
     elif config.data_split == 'dev':
         record_file = config.dev_record_file
         eval_file = config.dev_eval_file
-        ranking_file = config.dev_ranking_file
     elif config.data_split == 'test':
         record_file = config.test_record_file
         eval_file = config.test_eval_file
-        ranking_file = config.test_ranking_file
 
     build_features(config, examples, config.data_split, record_file)
     save(eval_file, eval_examples, message='{} eval'.format(config.data_split))
-    save(ranking_file, ranking_examples, message='{} ranking'.format(config.data_split))
 
