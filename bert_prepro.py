@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 
 N_ARTICLES = 10
 BERT_MAX_SEQ_LEN = 512
+MAX_SENT_LEN = 256 - 65 - 3
 bert_tokenizer = BertTokenizer.from_pretrained('bert-base-cased', return_token_type_ids=True)
 t5_tokenizer = T5Tokenizer.from_pretrained('t5-base')
 tokenizer = 'placeholder'
@@ -545,11 +546,13 @@ def build_features(config, examples, split, out_file):
                 for el in sent_spans:
                     s, e, is_sup_fact = el
                     length = min(e - s, max_tokens_for_seq)
+                    if split == 'train' and e - s > MAX_SENT_LEN:
+                        continue
                     if e - s > max_tokens_for_seq:
                         cropped_sentences += 1
                     sup_labels.append(is_sup_fact)
                     doc_spans.append(_DocSpan(para_i, start=s, length=length))
-                    datapoint_lens.append(e-s)
+                    datapoint_lens.append(e - s)
         else:
             print(f'sorry, there is no such level {config.level}')
         num_chunks = len(doc_spans)
@@ -605,7 +608,7 @@ def build_features(config, examples, split, out_file):
     chunk_lens = np.array(chunk_lens)
     all_sup_labels = np.array(all_sup_labels)
     datapoint_lens = np.array(datapoint_lens)
-    plot_stats(config, chunk_lens, datapoint_lens, all_sup_labels)
+    plot_stats(config, chunk_lens, datapoint_lens, all_sup_labels, split)
     
     assert len(datapoint_lens) == len(all_sup_labels), f'len of datapoints lens: {len(datapoints_lens)} does not match len of sup labels: {len(all_sup_labels)}'
     print(f"max chunks: {max_chunks}, sup chunks: {sup_chunks}, avg num of sup chunks: {sup_chunks / span_ex_count}")
@@ -635,7 +638,7 @@ def build_features(config, examples, split, out_file):
                                     f' total number of examples: {len(examples)}'
 
 
-def plot_stats(config, chunk_lens, datapoint_lens, all_sup_labels):
+def plot_stats(config, chunk_lens, datapoint_lens, all_sup_labels, split):
     fig, axs = plt.subplots(ncols=2, nrows=2, sharey='all')
     axs = axs.flatten()
     
@@ -645,16 +648,16 @@ def plot_stats(config, chunk_lens, datapoint_lens, all_sup_labels):
     shared_list[0].get_shared_x_axes().join(*shared_list)
     name = 'Fact' if config.level == 'sentence' else 'Chunk'
 
-    axs[0].hist(chunk_lens)
+    axs[0].hist(chunk_lens, bins=35)
     axs[0].set_title(f'{name} number\n distribution\n')
 
-    axs[1].hist(datapoint_lens)
+    axs[1].hist(datapoint_lens, bins=35)
     axs[1].set_title(f'{name} token number \n distribution\n')
 
-    axs[2].hist(datapoint_lens[all_sup_labels.astype(bool)])
+    axs[2].hist(datapoint_lens[all_sup_labels.astype(bool)], bins=35)
     axs[2].set_title(f'Supporting {name} token number \n distribution\n')
 
-    axs[3].hist(datapoint_lens[(1 - all_sup_labels).astype(bool)])
+    axs[3].hist(datapoint_lens[(1 - all_sup_labels).astype(bool)], bins=35)
     axs[3].set_title(f'Non-supporting {name} token number \n distribution\n')
     fig.tight_layout()
     plt.savefig(f'plots/{split}_{config.level}_eda.png')

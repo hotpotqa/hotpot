@@ -143,6 +143,7 @@ def _process_article(article, config):
                 # in the fullwiki setting, the answer might not have been retrieved
                 # use (0, 1) so that we can proceed
                 best_indices = (0, 1)
+                print('UNANSWERABLE EXAMPLE:', article['_id'])
             else:
                 _, best_indices, _ = fix_span(text_context, offsets, article['answer'])
                 answer_span = []
@@ -154,6 +155,7 @@ def _process_article(article, config):
         # some random stuff
         answer = 'random'
         best_indices = (0, 1)
+        print('UNANSWERABLE EXAMPLE:', article['_id'])
 
     ques_tokens = word_tokenize(prepro_sent(article['question']))
     ques_chars = [list(token) for token in ques_tokens]
@@ -319,13 +321,14 @@ def save(filename, obj, message=None):
 
 def prepro(config):
     random.seed(13)
-
+    print('NO BERT PREPRO')
     if config.data_split == 'train':
         word_counter, char_counter = Counter(), Counter()
         examples, eval_examples = process_file(config.data_file, config, word_counter, char_counter)
     else:
         examples, eval_examples = process_file(config.data_file, config)
 
+    return 
     word2idx_dict = None
     if os.path.isfile(config.word2idx_file):
         with open(config.word2idx_file, "r") as fh:
