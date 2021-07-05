@@ -1,5 +1,6 @@
 import os
 from prepro import prepro
+from bert_prepro import prepro as BERT_prepro
 from run import train, test
 import argparse
 
@@ -16,9 +17,11 @@ word2idx_file = "word2idx.json"
 char2idx_file = "char2idx.json"
 idx2word_file = 'idx2word.json'
 idx2char_file = 'idx2char.json'
-train_record_file = 'train_record.pkl'
-dev_record_file = 'dev_record.pkl'
-test_record_file = 'test_record.pkl'
+train_record_file = 'train_record.jsonl'
+dev_record_file = 'dev_record.jsonl'
+test_record_file = 'test_record.jsonl'
+yes_no_example_file = 'yn_id_to_ans.pickle'
+
 
 
 parser.add_argument('--mode', type=str, default='train')
@@ -39,6 +42,8 @@ parser.add_argument('--idx2char_file', type=str, default=idx2char_file)
 parser.add_argument('--train_record_file', type=str, default=train_record_file)
 parser.add_argument('--dev_record_file', type=str, default=dev_record_file)
 parser.add_argument('--test_record_file', type=str, default=test_record_file)
+
+parser.add_argument('--yes_no_example_file', type=str, default=yes_no_example_file)
 
 parser.add_argument('--glove_char_size', type=int, default=94)
 parser.add_argument('--glove_word_size', type=int, default=int(2.2e6))
@@ -67,23 +72,38 @@ parser.add_argument('--fullwiki', action='store_true')
 parser.add_argument('--prediction_file', type=str)
 parser.add_argument('--sp_threshold', type=float, default=0.3)
 
+parser.add_argument('--num_files', type=int, default=1)
+parser.add_argument('--tokenizer', type=str, default='spacy')
+parser.add_argument('--doc_stride', type=int, default=128)
+parser.add_argument('--is_training', type=bool, default=True)
+parser.add_argument('--max_query_length', type=int, default=75)
+parser.add_argument('--max_seq_length', type=int, default=512)
+parser.add_argument('--level', type=str, default='paragraph')
+
 config = parser.parse_args()
 
-def _concat(filename):
+def _concat(config, filename):
+    new_name = filename
+    #new_name = '{}_{}'.format(config.level, filename)
     if config.fullwiki:
-        return 'fullwiki.{}'.format(filename)
-    return filename
-# config.train_record_file = _concat(config.train_record_file)
-config.dev_record_file = _concat(config.dev_record_file)
-config.test_record_file = _concat(config.test_record_file)
-# config.train_eval_file = _concat(config.train_eval_file)
-config.dev_eval_file = _concat(config.dev_eval_file)
-config.test_eval_file = _concat(config.test_eval_file)
+        new_name = 'fullwiki.{}'.format(new_name)
+    return new_name
+
+config.train_record_file = _concat(config, config.train_record_file)
+config.dev_record_file = _concat(config, config.dev_record_file)
+config.test_record_file = _concat(config, config.test_record_file)
+config.dev_eval_file = _concat(config, config.dev_eval_file)
+config.test_eval_file = _concat(config, config.test_eval_file)
+
+print(config.dev_record_file)
 
 if config.mode == 'train':
     train(config)
 elif config.mode == 'prepro':
-    prepro(config)
+    if config.tokenizer == 'spacy':
+        prepro(config)
+    else:
+        BERT_prepro(config)
 elif config.mode == 'test':
     test(config)
 elif config.mode == 'count':
