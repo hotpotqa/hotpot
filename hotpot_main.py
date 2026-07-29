@@ -1,85 +1,665 @@
-\"\"\"
-hotpot_main.py
-==============
-Extended entry-point for the HotpotQA baseline system.
+"""hotpot_main.py
 
-Internet Retriever Functions
------------------------------
-  fetch_url_text(url, ...)
-      Fetches a URL, strips HTML, returns clean text.
+Extended entry-point for the HotpotQA baseline that adds an **Internet
+Retriever** layer on top of the original train / prepro / test pipeline.
 
-  wikipedia_search(query, top_k)
-      OpenSearch API query returning title/snippet/URL tuples.
+The retriever can be used in two ways:
 
-  wikipedia_page_extract(title, ...)
-      REST summary API: returns the introductory plain-text extract.
+1. Stand-alone interactive mode (``--mode retrieve``):
+   Given a question it fetches candidate Wikipedia / web passages,
+   ranks them, and prints the top-k results.
 
-  fetch_wikipedia_paragraphs(title, ...)          [NEW]
-      Full-article plain-text paragraphs via MediaWiki action=query
-      prop=extracts.  Returns a list of paragraph strings.
+2. Augmented inference mode (``--mode retrieve_test``):
+   Runs retrieval for every question in the test-eval file, injects the
+   retrieved passages as additional context, then calls the trained model
+   for prediction.  Useful for the *fullwiki* distractor setting where
+   the gold paragraphs are NOT provided at test time.
 
-  duckduckgo_search(query, top_k)
-      Scrapes DuckDuckGo HTML results for URLs.
-
-  google_search_scrape(query, top_k)               [NEW ADDITION]
-      Scrapes Google Search for URLs.
-
-  _extract_entities(question)                     [NEW]
-      Uses spaCy NER (en_core_web_sm) to pull named entities from a
-      question; falls back to noun-chunks when no NEs are found.
-
-  retrieve_context_for_question(question, ...)    [NEW]
-      End-to-end: extracts entities -> fetches Wikipedia paragraphs
-      for each -> deduplicates -> returns ranked (title, para) list.
-
-  build_context_from_internet(question, ...)      [NEW]
-      Wraps retrieve_context_for_question and splits paragraphs into
-      sentences, returning HotpotQA-style context dicts:
-          {\"title\": ..., \"sentences\": [...]}\n      Ready to be used directly as the \"context\" field of a HotpotQA
-      sample for prepro.py.
-
-  InternetRetriever (class)
-      Object-oriented interface: search() / retrieve() / format_context().
-      Supports Wikipedia, DuckDuckGo, and Google backends.
-
-  build_internet_retriever_from_config(config)
-      Constructs an InternetRetriever from CLI config flags.
-
-  maybe_preview_internet_context(config)
-      Convenience: runs retrieval for --internet_query and prints/saves
-      the result.
-
-  retrieve_mode(config)                           [NEW]
-      --mode retrieve  entry-point.  Reads a JSONL question file
-      ({\"_id\":..., \"question\":...} per line), fetches internet context
-      for every question with build_context_from_internet(), and writes
-      a HotpotQA-format JSON file ready for prepro.py.
-
-Original modes (train / prepro / test / count) are preserved unchanged.
-
-Dependencies
-------------
-  Standard library only for the original modes.
-  For retrieve mode and NER-based retrieval:
-      pip install requests spacy
-      python -m spacy download en_core_web_sm
-\"\"\"
+Dependencies (beyond the original repo requirements):
+    pip install requests beautifulsoup4 wikipedia-api rank_bm25
+"""
 
 import os
 import re
-import json
 import time
+import json
 import logging
 import argparse
-import urllib.parse
-import urllib.request
-from html.parser import HTMLParser
 from typing import List, Dict, Tuple, Optional
 
+# ---------------------------------------------------------------------------
+# Optional heavy imports -- only fail at call-time so the rest of the module
+# can still be imported in environments where these are absent.
+# ---------------------------------------------------------------------------
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError:
+    requests = None  # type: ignore
+    BeautifulSoup = None  # type: ignore
+
+try:
+    import wikipediaapi
+except ImportError:
+    wikipediaapi = None  # type: ignore
+
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    BM25Okapi = None  # type: ignore
+
+# ---------------------------------------------------------------------------
+# Re-export the original pipeline so this file can replace main.py entirely.
+# ---------------------------------------------------------------------------
 from prepro import prepro
 from run import train, test
 
-_logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------\n# Optional imports (lazy) for new retriever functions
-# ---------------------------------------------------------------------------\n\n_nlp = None  # spaCy model, loaded on first use\n\ndef _get_nlp():\n    \"\"\"Return a cached spaCy NLP pipeline (loaded on first call).\"\"\"\n    global _nlp\n    if _nlp is None:\n        try:\n            import spacy\n            _nlp = spacy.load(\"en_core_web_sm\")\n        except OSError:\n            raise RuntimeError(\n                \"spaCy model 'en_core_web_sm' not found.  \"\n                \"Run:  python -m spacy download en_core_web_sm\"\n            )\n    return _nlp\n\n\n# ---------------------------------------------------------------------------\n# Utility helpers (original)\n# ---------------------------------------------------------------------------\n\nclass _HTMLTextExtractor(HTMLParser):\n    def __init__(self):\n        HTMLParser.__init__(self)\n        self._chunks = []\n        self._skip_depth = 0\n\n    def handle_starttag(self, tag, attrs):\n        if tag in ('script', 'style'):\n            self._skip_depth += 1\n\n    def handle_endtag(self, tag):\n        if tag in ('script', 'style') and self._skip_depth > 0:\n            self._skip_depth -= 1\n\n    def handle_data(self, data):\n        if self._skip_depth == 0:\n            text = data.strip()\n            if text:\n                self._chunks.append(text)\n\n    def get_text(self):\n        return ' '.join(self._chunks)\n\n\ndef _clean_text(text):\n    text = re.sub(r'\\s+', ' ', text)\n    return text.strip()\n\n\ndef _safe_urlopen(url, timeout=10, headers=None):\n    request = urllib.request.Request(url, headers=headers or {\n        'User-Agent': 'hotpotqa-internet-retriever/1.0'\n    })\n    return urllib.request.urlopen(request, timeout=timeout)\n\n\n# ---------------------------------------------------------------------------\n# Low-level fetch helpers (original, kept intact)\n# ---------------------------------------------------------------------------\n\ndef fetch_url_text(url, timeout=10, max_chars=5000):\n    \"\"\"Fetch a URL and return stripped plain text (up to max_chars).\"\"\"\n    try:\n        response = _safe_urlopen(url, timeout=timeout)\n        content_type = response.headers.get('Content-Type', '')\n        raw = response.read()\n        charset = response.headers.get_content_charset() or 'utf-8'\n        text = raw.decode(charset, errors='replace')\n\n        if 'html' in content_type:\n            parser = _HTMLTextExtractor()\n            parser.feed(text)\n            text = parser.get_text()\n\n        text = _clean_text(text)\n        if max_chars is not None:\n            text = text[:max_chars]\n        return text\n    except Exception:\n        return ''\n\n\ndef wikipedia_search(query, top_k=5):\n    \"\"\"OpenSearch API: return list of {title, snippet, url} dicts.\"\"\"\n    encoded = urllib.parse.quote(query)\n    url = (\n        'https://en.wikipedia.org/w/api.php'\n        '?action=opensearch&search={}&limit={}&namespace=0&format=json'\n        .format(encoded, top_k)\n    )\n    try:\n        response = _safe_urlopen(url)\n        data = json.loads(response.read().decode('utf-8'))\n        titles = data[1]\n        descriptions = data[2]\n        links = data[3]\n        results = []\n        for idx, title in enumerate(titles):\n            results.append({\n                'title': title,\n                'snippet': descriptions[idx] if idx < len(descriptions) else '',\n                'url': links[idx] if idx < len(links) else ''\n            })\n        return results\n    except Exception:\n        return []\n\n\ndef wikipedia_page_extract(title, max_chars=3000):\n    \"\"\"REST summary API: return the introductory extract for *title*.\"\"\"\n    encoded = urllib.parse.quote(title)\n    url = 'https://en.wikipedia.org/api/rest_v1/page/summary/{}'.format(encoded)\n    try:\n        response = _safe_urlopen(url)\n        data = json.loads(response.read().decode('utf-8'))\n        extract = data.get('extract', '')\n        return _clean_text(extract)[:max_chars]\n    except Exception:\n        return ''\n\n\ndef duckduckgo_search(query, top_k=5):\n    \"\"\"Scrape DuckDuckGo HTML for URLs (no API key needed).\"\"\"\n    encoded = urllib.parse.quote(query)\n    url = 'https://duckduckgo.com/html/?q={}'.format(encoded)\n    try:\n        html = fetch_url_text(url, timeout=10, max_chars=20000)\n        if not html:\n            return []\n\n        pattern = re.compile(r'(https?://[^\\s]+)')\n        urls = []\n        for match in pattern.findall(html):\n            if match not in urls:\n                urls.append(match)\n            if len(urls) >= top_k:\n                break\n\n        return [{'title': u, 'snippet': '', 'url': u} for u in urls]\n    except Exception:\n        return []\n\n# ---------------------------------------------------------------------------\n# NEW ADDITION: Google Search Scraping\n# ---------------------------------------------------------------------------\n\ndef google_search_scrape(query: str, top_k: int = 5) -> List[Dict]:\n    \"\"\"Scrape Google Search results for URLs.\n\n    Warning: This is a basic scraper and may be blocked by Google.\n    For production, use Google Custom Search API.\n    \"\"\"\n    encoded = urllib.parse.quote(query)\n    url = 'https://www.google.com/search?q={}&num={}'.format(encoded, top_k)\n    headers = {\n        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'\n    }\n    try:\n        text = fetch_url_text(url, headers=headers, max_chars=50000)\n        if not text:\n            return []\n\n        # Simple regex to find URLs in the search results\n        pattern = re.compile(r'https?://[a-zA-Z0-9./?=_-]+')\n        urls = []\n        for match in pattern.findall(text):\n            if 'google.com' in match or 'gstatic.com' in match:\n                continue\n            if match not in urls:\n                urls.append(match)\n            if len(urls) >= top_k:\n                break\n\n        return [{'title': u, 'snippet': '', 'url': u} for u in urls]\n    except Exception as exc:\n        _logger.warning('Google search scrape failed for %r: %s', query, exc)\n        return []\n\n\n# ---------------------------------------------------------------------------\n# NEW: full-article paragraph retrieval via MediaWiki action=query\n# ---------------------------------------------------------------------------\n\nWIKIPEDIA_PARSE_API = 'https://en.wikipedia.org/w/api.php'\n\n\ndef fetch_wikipedia_paragraphs(\n    title: str,\n    timeout: int = 10,\n    max_paragraphs: int = 10,\n) -> List[str]:\n    \"\"\"Fetch plain-text paragraphs from a Wikipedia article.\n\n    Uses the MediaWiki ``action=query&prop=extracts&explaintext`` endpoint\n    to retrieve the full article text, then splits on double newlines and\n    filters short/header-only blocks.\n\n    Parameters\n    ----------\n    title : str\n        Wikipedia article title (spaces or underscores both accepted).\n    timeout : int\n        HTTP request timeout in seconds.\n    max_paragraphs : int\n        Maximum number of paragraphs to return.\n\n    Returns\n    -------\n    List[str]\n        Plain-text paragraphs; empty list if the article is not found.\n    \"\"\"\n    params = urllib.parse.urlencode({\n        'action': 'query',\n        'titles': title,\n        'prop': 'extracts',\n        'explaintext': '1',\n        'exsectionformat': 'plain',\n        'format': 'json',\n        'redirects': '1',\n    })\n    api_url = '{}?{}'.format(WIKIPEDIA_PARSE_API, params)\n    try:\n        response = _safe_urlopen(api_url, timeout=timeout)\n        data = json.loads(response.read().decode('utf-8'))\n    except Exception as exc:\n        _logger.warning('Wikipedia paragraph fetch failed for %r: %s', title, exc)\n        return []\n\n    pages = data.get('query', {}).get('pages', {})\n    if not pages:\n        return []\n\n    page = next(iter(pages.values()))\n    if 'missing' in page:\n        _logger.debug('Wikipedia article not found: %r', title)\n        return []\n\n    raw_text = page.get('extract', '')\n    if not raw_text:\n        return []\n\n    paragraphs = []\n    for block in raw_text.split('\\n\\n'):\n        block = block.strip()\n        if not block:\n            continue\n        if block.startswith('=='):      # section header\n            continue\n        block = re.sub(r'\\s+', ' ', block)\n        if len(block) < 40:             # skip stubs\n            continue\n        paragraphs.append(block)\n        if len(paragraphs) >= max_paragraphs:\n            break\n\n    return paragraphs\n\n\n# ---------------------------------------------------------------------------\n# NEW: NER-based entity extraction\n# ---------------------------------------------------------------------------\n\n_NER_LABELS = {\n    'PERSON', 'ORG', 'GPE', 'LOC', 'PRODUCT',\n    'WORK_OF_ART', 'EVENT', 'FAC', 'LAW', 'NORP',\n}\n\n\ndef _extract_entities(question: str) -> List[str]:\n    \"\"\"Return a deduplicated list of named-entity strings from *question*.\n\n    Uses spaCy NER (en_core_web_sm).  Falls back to noun-chunks when no\n    recognised entities are found.\n    \"\"\"\n    nlp = _get_nlp()\n    doc = nlp(question)\n\n    entities = [ent.text for ent in doc.ents if ent.label_ in _NER_LABELS]\n\n    if not entities:\n        entities = [chunk.text for chunk in doc.noun_chunks]\n\n    # Deduplicate while preserving order\n    seen: set = set()\n    unique: List[str] = []\n    for e in entities:\n        key = e.lower()\n        if key not in seen:\n            seen.add(key)\n            unique.append(e)\n    return unique\n\n\n# ---------------------------------------------------------------------------\n# NEW: retrieve_context_for_question\n# ---------------------------------------------------------------------------\n\ndef retrieve_context_for_question(\n    question: str,\n    top_k: int = 10,\n    paragraphs_per_entity: int = 3,\n    sleep_between_requests: float = 0.2,\n) -> List[Tuple[str, str]]:\n    \"\"\"Retrieve Wikipedia context paragraphs relevant to *question*.\n\n    Algorithm\n    ---------\n    1. Extract named entities (or noun-chunks) from *question* using spaCy.\n    2. For each unique entity, fetch up to *paragraphs_per_entity*\n       Wikipedia paragraphs via fetch_wikipedia_paragraphs().\n    3. Return the first *top_k* (title, paragraph) pairs.\n\n    Parameters\n    ----------\n    question : str\n        The multi-hop question to retrieve context for.\n    top_k : int\n        Maximum number of (title, paragraph) pairs to return.\n    paragraphs_per_entity : int\n        Maximum paragraphs to keep per Wikipedia article.\n    sleep_between_requests : float\n        Polite delay (seconds) between Wikipedia API calls.\n\n    Returns\n    -------\n    List[Tuple[str, str]]\n        Each element is ``(article_title, paragraph_text)``.\n    \"\"\"\n    entities = _extract_entities(question)\n    _logger.debug('Entities for question %r: %s', question[:60], entities)\n\n    results: List[Tuple[str, str]] = []\n    seen_titles: set = set()\n\n    for entity in entities:\n        if len(results) >= top_k:\n            break\n        key = entity.lower()\n        if key in seen_titles:\n            continue\n        seen_titles.add(key)\n\n        paras = fetch_wikipedia_paragraphs(entity, max_paragraphs=paragraphs_per_entity)\n        for para in paras:\n            results.append((entity, para))\n            if len(results) >= top_k:\n                break\n\n        if sleep_between_requests > 0:\n            time.sleep(sleep_between_requests)\n\n    return results\n\n\n# ---------------------------------------------------------------------------\n# NEW: build_context_from_internet\n# ---------------------------------------------------------------------------\n\ndef build_context_from_internet(\n    question: str,\n    top_k: int = 10,\n    paragraphs_per_entity: int = 3,\n) -> List[Dict]:\n    \"\"\"Return HotpotQA-style context dicts retrieved from the internet.\n\n    Each dict has the form::\n\n        {\n            \"title\": \"<Wikipedia article title>\",\n            \"sentences\": [\"sentence 1\", \"sentence 2\", ...]\n        }\n\n    Paragraphs are sentence-split with spaCy to match the sentence-level\n    supervision format expected by prepro.py.\n\n    Parameters\n    ----------\n    question : str\n        The multi-hop question.\n    top_k : int\n        Maximum number of (title, paragraph) pairs to retrieve.\n    paragraphs_per_entity : int\n        Maximum paragraphs per Wikipedia article.\n\n    Returns\n    -------\n    List[Dict]\n        HotpotQA context dicts, one per retrieved paragraph.\n    \"\"\"\n    nlp = _get_nlp()\n    raw_pairs = retrieve_context_for_question(\n        question,\n        top_k=top_k,\n        paragraphs_per_entity=paragraphs_per_entity,\n    )\n\n    context_dicts: List[Dict] = []\n    for title, paragraph in raw_pairs:\n        doc = nlp(paragraph)\n        sentences = [s.text.strip() for s in doc.sents if s.text.strip()]\n        context_dicts.append({'title': title, 'sentences': sentences})\n\n    return context_dicts\n\n\n# ---------------------------------------------------------------------------\n# NEW: retrieve_mode  (--mode retrieve)\n# ---------------------------------------------------------------------------\n\ndef retrieve_mode(config) -> None:\n    \"\"\"Batch retrieval: reads a JSONL question file, writes HotpotQA JSON.\n\n    Input (JSONL, one object per line)::\n\n        {\"_id\": \"abc123\", \"question\": \"Who directed ...?\"}\n\n    Output (JSON at --retrieve_output_file)::\n\n        [\n          {\n            \"_id\": \"abc123\",\n            \"question\": \"...\",\n            \"answer\": \"\",\n            \"type\": \"bridge\",\n            \"level\": \"hard\",\n            \"supporting_facts\": [],\n            \"context\": [\n              {\"title\": \"...\", \"sentences\": [\"...\", ...]},\n              ...\n            ]\n          },\n          ...\n        ]\n\n    The output can be passed directly to prepro.py.\n    \"\"\"\n    if not config.data_file:\n        raise ValueError('--data_file must be provided for --mode retrieve')\n\n    output_file = getattr(config, 'retrieve_output_file', 'retrieved_context.json')\n    top_k = getattr(config, 'retrieve_top_k', 10)\n\n    print('[retrieve] Reading questions from: {}'.format(config.data_file))\n    print('[retrieve] Writing output to:      {}'.format(output_file))\n    print('[retrieve] top_k paragraphs:        {}'.format(top_k))\n\n    samples = []\n    with open(config.data_file, 'r', encoding='utf-8') as fh:\n        for line in fh:\n            line = line.strip()\n            if line:\n                samples.append(json.loads(line))\n\n    output_samples = []\n    for idx, sample in enumerate(samples):\n        qid = sample.get('_id', str(idx))\n        question = sample.get('question', '')\n        print('  [{}/{}] id={}  q={}'.format(idx + 1, len(samples), qid, question[:80]))\n\n        context = build_context_from_internet(question, top_k=top_k)\n\n        output_samples.append({\n            '_id': qid,\n            'question': question,\n            'answer': sample.get('answer', ''),\n            'type': sample.get('type', 'bridge'),\n            'level': sample.get('level', 'hard'),\n            'supporting_facts': sample.get('supporting_facts', []),\n            'context': context,\n        })\n\n    with open(output_file, 'w', encoding='utf-8') as fh:\n        json.dump(output_samples, fh, indent=2, ensure_ascii=False)\n\n    print('[retrieve] Done. Wrote {} samples to {}'.format(len(output_samples), output_file))\n\n\n# ---------------------------------------------------------------------------\n# InternetRetriever class\n# ---------------------------------------------------------------------------\n\nclass InternetRetriever(object):\n    \"\"\"Object-oriented internet retriever supporting Wikipedia, DuckDuckGo, and Google.\n\n    Parameters\n    ----------\n    use_wikipedia : bool\n        Query Wikipedia OpenSearch.\n    use_duckduckgo : bool\n        Query DuckDuckGo.\n    use_google : bool\n        Query Google Search scrape.\n    fetch_pages : bool\n        If True, fetch full page text in addition to snippets.\n    top_k : int\n        Maximum number of results to return per query.\n    snippet_chars : int\n        Maximum characters to keep from each snippet.\n    page_chars : int\n        Maximum characters to fetch from full pages.\n    \"\"\"\n\n    def __init__(self, use_wikipedia=True, use_duckduckgo=False, use_google=False, fetch_pages=True,\n                 top_k=5, snippet_chars=1200, page_chars=3000):\n        self.use_wikipedia = use_wikipedia\n        self.use_duckduckgo = use_duckduckgo\n        self.use_google = use_google\n        self.fetch_pages = fetch_pages\n        self.top_k = top_k\n        self.snippet_chars = snippet_chars\n        self.page_chars = page_chars\n\n    def search(self, query):\n        \"\"\"Return raw search result dicts from enabled backends.\"\"\"\n        results = []\n        seen = set()\n\n        if self.use_wikipedia:\n            for item in wikipedia_search(query, top_k=self.top_k):\n                url = item.get('url', '')\n                if url and url not in seen:\n                    item['source'] = 'wikipedia'\n                    results.append(item)\n                    seen.add(url)\n\n        if self.use_duckduckgo:\n            for item in duckduckgo_search(query, top_k=self.top_k):\n                url = item.get('url', '')\n                if url and url not in seen:\n                    item['source'] = 'duckduckgo'\n                    results.append(item)\n                    seen.add(url)\n\n        if self.use_google:\n            for item in google_search_scrape(query, top_k=self.top_k):\n                url = item.get('url', '')\n                if url and url not in seen:\n                    item['source'] = 'google'\n                    results.append(item)\n                    seen.add(url)\n\n        return results[:self.top_k]\n\n    def retrieve(self, query):\n        \"\"\"Search and optionally fetch full page text; return enriched dicts.\"\"\"\n        results = self.search(query)\n        enriched = []\n        for item in results:\n            text = item.get('snippet', '') or ''\n            if self.fetch_pages:\n                if item.get('source') == 'wikipedia' and item.get('title'):\n                    page_text = wikipedia_page_extract(item['title'], max_chars=self.page_chars)\n                else:\n                    page_text = fetch_url_text(item.get('url', ''), max_chars=self.page_chars)\n                if page_text:\n                    text = page_text\n            text = _clean_text(text)[:self.snippet_chars]\n            enriched.append({\n                'title': item.get('title', ''),\n                'url': item.get('url', ''),\n                'source': item.get('source', ''),\n                'text': text,\n            })\n        return enriched\n\n    def format_context(self, query):\n        \"\"\"Return a human-readable string of retrieved context for *query*.\"\"\"\n        docs = self.retrieve(query)\n        lines = []\n        for idx, doc in enumerate(docs):\n            lines.append('[{}] {} ({})'.format(idx + 1, doc['title'], doc['source']))\n            if doc['url']:\n                lines.append('URL: {}'.format(doc['url']))\n            lines.append(doc['text'])\n            lines.append('')\n        return '\\n'.join(lines).strip()\n\n\ndef build_internet_retriever_from_config(config):\n    \"\"\"Construct an InternetRetriever from CLI config flags.\"\"\"\n    return InternetRetriever(\n        use_wikipedia=not config.disable_wikipedia_retriever,\n        use_duckduckgo=config.enable_duckduckgo_retriever,\n        use_google=config.enable_google_retriever,\n        fetch_pages=not config.disable_page_fetch,\n        top_k=config.internet_top_k,\n        snippet_chars=config.internet_snippet_chars,\n        page_chars=config.internet_page_chars,\n    )\n\n\ndef maybe_preview_internet_context(config):\n    \"\"\"Run retrieval for --internet_query and print/save the result.\"\"\"\n    if not config.internet_retriever:\n        return\n    if not config.internet_query:\n        print('Internet retriever enabled, but no --internet_query was provided.')\n        return\n\n    retriever = build_internet_retriever_from_config(config)\n    context = retriever.format_context(config.internet_query)\n\n    if config.internet_output_file:\n        with open(config.internet_output_file, 'w') as fh:\n            fh.write(context)\n        print('Saved internet retrieval context to {}'.format(config.internet_output_file))\n    else:\n        print('Internet retrieval context:')\n        print(context)\n\n\n# ---------------------------------------------------------------------------\n# CLI argument parser\n# ---------------------------------------------------------------------------\n\nparser = argparse.ArgumentParser(\n    description='HotpotQA baseline -- extended with internet retrieval'\n)\n\nglove_word_file   = 'glove.840B.300d.txt'\nword_emb_file     = 'word_emb.json'\nchar_emb_file     = 'char_emb.json'\ntrain_eval        = 'train_eval.json'\ndev_eval          = 'dev_eval.json'\ntest_eval         = 'test_eval.json'\nword2idx_file     = 'word2idx.json'\nchar2idx_file     = 'char2idx.json'\nidx2word_file     = 'idx2word.json'\nidx2char_file     = 'idx2char.json'\ntrain_record_file = 'train_record.pkl'\ndev_record_file   = 'dev_record.pkl'\ntest_record_file  = 'test_record.pkl'\n\n# ---- original arguments ---------------------------------------------------\nparser.add_argument('--mode', type=str, default='train',\n                    choices=['train', 'prepro', 'test', 'count', 'retrieve'],\n                    help=\"Execution mode. Use 'retrieve' to fetch internet \"\n                         \"context for a JSONL question file.\")\nparser.add_argument('--data_file',          type=str)\nparser.add_argument('--glove_word_file',    type=str, default=glove_word_file)\nparser.add_argument('--save',               type=str, default='HOTPOT')\nparser.add_argument('--word_emb_file',      type=str, default=word_emb_file)\nparser.add_argument('--char_emb_file',      type=str, default=char_emb_file)\nparser.add_argument('--train_eval_file',    type=str, default=train_eval)\nparser.add_argument('--dev_eval_file',      type=str, default=dev_eval)\nparser.add_argument('--test_eval_file',     type=str, default=test_eval)\nparser.add_argument('--word2idx_file',      type=str, default=word2idx_file)\nparser.add_argument('--char2idx_file',      type=str, default=char2idx_file)\nparser.add_argument('--idx2word_file',      type=str, default=idx2word_file)\nparser.add_argument('--idx2char_file',      type=str, default=idx2char_file)\nparser.add_argument('--train_record_file',  type=str, default=train_record_file)\nparser.add_argument('--dev_record_file',    type=str, default=dev_record_file)\nparser.add_argument('--test_record_file',   type=str, default=test_record_file)\nparser.add_argument('--glove_char_size',    type=int, default=94)\nparser.add_argument('--glove_word_size',    type=int, default=int(2.2e6))\nparser.add_argument('--glove_dim',          type=int, default=300)\nparser.add_argument('--char_dim',           type=int, default=8)\nparser.add_argument('--para_limit',         type=int, default=1000)\nparser.add_argument('--ques_limit',         type=int, default=80)\nparser.add_argument('--sent_limit',         type=int, default=100)\nparser.add_argument('--char_limit',         type=int, default=16)\nparser.add_argument('--batch_size',         type=int, default=64)\nparser.add_argument('--checkpoint',         type=int, default=1000)\nparser.add_argument('--period',             type=int, default=100)\nparser.add_argument('--init_lr',            type=float, default=0.5)\nparser.add_argument('--keep_prob',          type=float, default=0.8)\nparser.add_argument('--hidden',             type=int, default=80)\nparser.add_argument('--char_hidden',        type=int, default=100)\nparser.add_argument('--patience',           type=int, default=1)\nparser.add_argument('--seed',               type=int, default=13)\nparser.add_argument('--sp_lambda',          type=float, default=0.0)\nparser.add_argument('--data_split',         type=str, default='train')\nparser.add_argument('--fullwiki',           action='store_true')\nparser.add_argument('--prediction_file',    type=str)\nparser.add_argument('--sp_threshold',       type=float, default=0.3)\n\n# ---- InternetRetriever flags -----------------------------------\nparser.add_argument('--internet_retriever',           action='store_true')\nparser.add_argument('--internet_query',               type=str, default=None)\nparser.add_argument('--internet_output_file',         type=str, default=None)\nparser.add_argument('--internet_top_k',               type=int, default=5)\nparser.add_argument('--internet_snippet_chars',       type=int, default=1200)\nparser.add_argument('--internet_page_chars',          type=int, default=3000)\nparser.add_argument('--enable_duckduckgo_retriever',  action='store_true')\nparser.add_argument('--enable_google_retriever',      action='store_true')\nparser.add_argument('--disable_wikipedia_retriever',  action='store_true')\nparser.add_argument('--disable_page_fetch',           action='store_true')\n\n# ---- retrieve_mode (new) flags --------------------------------------------\nparser.add_argument(\n    '--retrieve_output_file',\n    type=str,\n    default='retrieved_context.json',\n    help='(retrieve mode) Path for the output HotpotQA-format JSON file.',\n)\nparser.add_argument(\n    '--retrieve_top_k',\n    type=int,\n    default=10,\n    help='(retrieve mode) Max (title, paragraph) pairs per question.',\n)\n\nconfig = parser.parse_args()\n\n\ndef _concat(filename):\n    if config.fullwiki:\n        return 'fullwiki.{}'.format(filename)\n    return filename\n\n\nconfig.dev_record_file  = _concat(config.dev_record_file)\nconfig.test_record_file = _concat(config.test_record_file)\nconfig.dev_eval_file    = _concat(config.dev_eval_file)\nconfig.test_eval_file   = _concat(config.test_eval_file)\n\n# ---------------------------------------------------------------------------\n# Mode dispatch\n# ---------------------------------------------------------------------------\n\nif config.mode == 'retrieve':\n    logging.basicConfig(\n        level=logging.INFO,\n        format='%(asctime)s %(levelname)s %(name)s -- %(message)s',\n    )\n    retrieve_mode(config)\nelif config.internet_retriever and config.mode == 'retrieve':\n    maybe_preview_internet_context(config)\nelif config.mode == 'train':\n    train(config)\nelif config.mode == 'prepro':\n    prepro(config)\nelif config.mode == 'test':\n    if config.internet_retriever:\n        maybe_preview_internet_context(config)\n    test(config)\nelif config.mode == 'count':\n    cnt_len(config)\n
+
+# ===========================================================================
+# Section 1 -- Low-level HTTP helpers
+# ===========================================================================
+
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+_SESSION: Optional["requests.Session"] = None  # re-used across calls
+
+
+def _get_session() -> "requests.Session":
+    """Return a lazily-created, keep-alive requests Session."""
+    global _SESSION
+    if requests is None:
+        raise ImportError(
+            "The 'requests' package is required for internet retrieval. "
+            "Install it with:  pip install requests"
+        )
+    if _SESSION is None:
+        _SESSION = requests.Session()
+        _SESSION.headers.update(
+            {"User-Agent": "HotpotQA-InternetRetriever/1.0 (research project)"}
+        )
+    return _SESSION
+
+
+def wikipedia_search_titles(
+    query: str,
+    top_k: int = 10,
+    timeout: float = 5.0,
+) -> List[str]:
+    """Return up to *top_k* Wikipedia article titles matching *query*.
+
+    Uses the MediaWiki ``opensearch`` API endpoint which is fast and
+    requires no authentication.
+    """
+    session = _get_session()
+    params = {
+        "action": "opensearch",
+        "search": query,
+        "limit": top_k,
+        "namespace": 0,
+        "format": "json",
+    }
+    try:
+        resp = session.get(WIKIPEDIA_API_URL, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        # opensearch returns [query, [titles], [descriptions], [urls]]
+        return data[1] if len(data) > 1 else []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("wikipedia_search_titles failed: %s", exc)
+        return []
+
+
+def fetch_wikipedia_intro(
+    title: str,
+    max_sentences: int = 10,
+    timeout: float = 8.0,
+) -> str:
+    """Fetch the introductory paragraph of a Wikipedia article.
+
+    Returns the text as a single string (sentences joined by spaces).
+    Falls back to an empty string on any error.
+    """
+    session = _get_session()
+    params = {
+        "action": "query",
+        "titles": title,
+        "prop": "extracts",
+        "exintro": True,
+        "explaintext": True,
+        "format": "json",
+    }
+    try:
+        resp = session.get(WIKIPEDIA_API_URL, params=params, timeout=timeout)
+        resp.raise_for_status()
+        pages = resp.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            extract = page.get("extract", "").strip()
+            if extract:
+                sentences = re.split(r"(?<=[.!?])\s+", extract)
+                return " ".join(sentences[:max_sentences])
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_wikipedia_intro('%s') failed: %s", title, exc)
+        return ""
+
+
+def fetch_wikipedia_full_text(
+    title: str,
+    timeout: float = 10.0,
+) -> str:
+    """Fetch the full plain-text of a Wikipedia article via the parse API."""
+    session = _get_session()
+    params = {
+        "action": "parse",
+        "page": title,
+        "prop": "wikitext",
+        "format": "json",
+    }
+    try:
+        resp = session.get(WIKIPEDIA_API_URL, params=params, timeout=timeout)
+        resp.raise_for_status()
+        wikitext = (
+            resp.json().get("parse", {}).get("wikitext", {}).get("*", "")
+        )
+        # Strip wiki markup with a simple heuristic
+        text = re.sub(r"\{\{[^}]*\}\}", "", wikitext)   # remove templates
+        text = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", text)  # links
+        text = re.sub(r"<[^>]+>", "", text)              # html tags
+        text = re.sub(r"={2,}[^=]+=+\n?", "", text)    # section headers
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return text
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_wikipedia_full_text('%s') failed: %s", title, exc)
+        return ""
+
+
+# ===========================================================================
+# Section 2 -- Passage splitting & ranking
+# ===========================================================================
+
+def split_into_sentences(text: str) -> List[str]:
+    """Split *text* into sentences using a lightweight regex heuristic."""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = 5,
+    overlap: int = 1,
+) -> List[str]:
+    """Divide *text* into overlapping sentence-level chunks.
+
+    Args:
+        text:       Source text.
+        chunk_size: Number of sentences per chunk.
+        overlap:    Number of sentences shared between consecutive chunks.
+
+    Returns:
+        List of passage strings.
+    """
+    sentences = split_into_sentences(text)
+    chunks: List[str] = []
+    step = max(1, chunk_size - overlap)
+    for i in range(0, len(sentences), step):
+        chunk = " ".join(sentences[i : i + chunk_size])
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def bm25_rank(
+    query: str,
+    passages: List[str],
+    top_k: int = 5,
+) -> List[Tuple[float, str]]:
+    """Rank *passages* against *query* using BM25.
+
+    Returns a list of (score, passage) tuples sorted by descending score.
+    Falls back to returning the first *top_k* passages if rank_bm25 is not
+    installed.
+    """
+    if not passages:
+        return []
+
+    if BM25Okapi is None:
+        logger.warning(
+            "rank_bm25 is not installed; returning first %d passages unranked. "
+            "Install with:  pip install rank_bm25",
+            top_k,
+        )
+        return [(0.0, p) for p in passages[:top_k]]
+
+    tokenized_corpus = [p.lower().split() for p in passages]
+    bm25 = BM25Okapi(tokenized_corpus)
+    query_tokens = query.lower().split()
+    scores = bm25.get_scores(query_tokens)
+    ranked = sorted(zip(scores, passages), key=lambda x: x[0], reverse=True)
+    return ranked[:top_k]
+
+
+# ===========================================================================
+# Section 3 -- High-level retriever interface
+# ===========================================================================
+
+class InternetRetriever:
+    """Retrieve and rank web / Wikipedia passages for a natural-language query.
+
+    Usage::
+
+        retriever = InternetRetriever(top_k_titles=5, top_k_passages=3)
+        results = retriever.retrieve("Who was the first person to walk on the Moon?")
+        for passage in results:
+            print(passage["title"], "|", passage["score"])
+            print(passage["text"])
+
+    Each result dict has the keys:
+        ``title``   -- Wikipedia article title.
+        ``text``    -- Retrieved passage text.
+        ``score``   -- BM25 relevance score (float).
+        ``url``     -- Canonical Wikipedia URL.
+    """
+
+    WIKI_BASE_URL = "https://en.wikipedia.org/wiki/"
+
+    def __init__(
+        self,
+        top_k_titles: int = 5,
+        top_k_passages: int = 3,
+        chunk_size: int = 5,
+        chunk_overlap: int = 1,
+        use_full_text: bool = False,
+        cache_dir: Optional[str] = None,
+    ) -> None:
+        self.top_k_titles = top_k_titles
+        self.top_k_passages = top_k_passages
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.use_full_text = use_full_text
+        self._cache: Dict[str, str] = {}  # title -> article text
+        self.cache_dir = cache_dir
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_path(self, title: str) -> str:
+        safe = re.sub(r"[^\w\-]", "_", title)
+        return os.path.join(self.cache_dir, f"{safe}.txt")  # type: ignore
+
+    def _load_from_disk(self, title: str) -> Optional[str]:
+        if not self.cache_dir:
+            return None
+        path = self._cache_path(title)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read()
+        return None
+
+    def _save_to_disk(self, title: str, text: str) -> None:
+        if not self.cache_dir:
+            return
+        path = self._cache_path(title)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    # ------------------------------------------------------------------
+    # Article fetching
+    # ------------------------------------------------------------------
+
+    def _get_article_text(self, title: str) -> str:
+        """Return article text, using in-memory then disk cache."""
+        if title in self._cache:
+            return self._cache[title]
+        disk_text = self._load_from_disk(title)
+        if disk_text is not None:
+            self._cache[title] = disk_text
+            return disk_text
+
+        if self.use_full_text:
+            text = fetch_wikipedia_full_text(title)
+        else:
+            text = fetch_wikipedia_intro(title)
+
+        self._cache[title] = text
+        self._save_to_disk(title, text)
+        return text
+
+    # ------------------------------------------------------------------
+    # Main retrieval method
+    # ------------------------------------------------------------------
+
+    def retrieve(
+        self,
+        query: str,
+        top_k_titles: Optional[int] = None,
+        top_k_passages: Optional[int] = None,
+    ) -> List[Dict]:
+        """Retrieve the most relevant passages for *query*.
+
+        Args:
+            query:          Natural-language question or query string.
+            top_k_titles:   Override instance default for number of Wikipedia
+                            titles to search.
+            top_k_passages: Override instance default for number of final
+                            passages to return.
+
+        Returns:
+            List of dicts, each with keys: title, text, score, url.
+        """
+        n_titles = top_k_titles or self.top_k_titles
+        n_passages = top_k_passages or self.top_k_passages
+
+        # 1. Retrieve candidate article titles
+        titles = wikipedia_search_titles(query, top_k=n_titles)
+        if not titles:
+            logger.warning("No Wikipedia titles found for query: %s", query)
+            return []
+
+        # 2. Fetch article text and split into passages
+        all_passages: List[Tuple[str, str]] = []  # (title, passage)
+        for title in titles:
+            text = self._get_article_text(title)
+            if not text:
+                continue
+            chunks = chunk_text(text, self.chunk_size, self.chunk_overlap)
+            for chunk in chunks:
+                all_passages.append((title, chunk))
+
+        if not all_passages:
+            return []
+
+        # 3. Rank all passages with BM25
+        passage_texts = [p[1] for p in all_passages]
+        ranked = bm25_rank(query, passage_texts, top_k=n_passages)
+
+        # 4. Re-attach titles and build result dicts
+        # Build a reverse lookup: text -> title (first occurrence)
+        text_to_title: Dict[str, str] = {}
+        for title, passage in all_passages:
+            if passage not in text_to_title:
+                text_to_title[passage] = title
+
+        results: List[Dict] = []
+        for score, passage in ranked:
+            title = text_to_title.get(passage, "Unknown")
+            results.append(
+                {
+                    "title": title,
+                    "text": passage,
+                    "score": float(score),
+                    "url": self.WIKI_BASE_URL + title.replace(" ", "_"),
+                }
+            )
+        return results
+
+    def retrieve_batch(
+        self,
+        queries: List[str],
+        delay: float = 0.5,
+        **kwargs,
+    ) -> List[List[Dict]]:
+        """Run retrieval for a list of queries with an inter-request delay.
+
+        Args:
+            queries: List of question strings.
+            delay:   Seconds to sleep between requests (be a polite citizen).
+            **kwargs: Forwarded to :meth:`retrieve`.
+
+        Returns:
+            List of result lists, one per query.
+        """
+        all_results = []
+        for i, query in enumerate(queries):
+            logger.info("[%d/%d] Retrieving: %s", i + 1, len(queries), query)
+            results = self.retrieve(query, **kwargs)
+            all_results.append(results)
+            if i < len(queries) - 1:
+                time.sleep(delay)
+        return all_results
+
+
+# ===========================================================================
+# Section 4 -- Augmented test pipeline
+# ===========================================================================
+
+def augment_eval_file_with_retrieval(
+    eval_file: Dict,
+    retriever: InternetRetriever,
+    max_questions: Optional[int] = None,
+    delay: float = 0.3,
+) -> Dict:
+    """Inject retrieved passages into a HotpotQA eval-file dict.
+
+    For each question in *eval_file* the retriever is called and the top
+    passages are prepended to the existing ``context`` field.  This allows
+    the downstream model to consider web evidence even in the fullwiki
+    distractor setting.
+
+    Args:
+        eval_file:      The loaded JSON eval file (dict keyed by question id).
+        retriever:      An :class:`InternetRetriever` instance.
+        max_questions:  Process at most this many questions (for debugging).
+        delay:          Seconds between retrieval requests.
+
+    Returns:
+        A new dict with the same structure as *eval_file* but with augmented
+        ``context`` entries.
+    """
+    augmented: Dict = {}
+    items = list(eval_file.items())
+    if max_questions:
+        items = items[:max_questions]
+
+    for i, (qid, entry) in enumerate(items):
+        question = entry.get("question", "")
+        logger.info("[%d/%d] Augmenting qid %s", i + 1, len(items), qid)
+
+        retrieved = retriever.retrieve(question)
+
+        # Build new context paragraphs in HotpotQA format:
+        # [[title, [sentence1, sentence2, ...]], ...]
+        new_context = list(entry.get("context", []))
+        for passage in retrieved:
+            sentences = split_into_sentences(passage["text"])
+            new_context.insert(0, [passage["title"], sentences])
+
+        new_entry = dict(entry)
+        new_entry["context"] = new_context
+        augmented[qid] = new_entry
+
+        if i < len(items) - 1:
+            time.sleep(delay)
+
+    return augmented
+
+
+def retrieve_and_save(
+    eval_file_path: str,
+    output_path: str,
+    retriever: InternetRetriever,
+    max_questions: Optional[int] = None,
+) -> None:
+    """Load an eval file, augment it with retrieval, and write to *output_path*."""
+    with open(eval_file_path, "r", encoding="utf-8") as fh:
+        eval_file = json.load(fh)
+
+    augmented = augment_eval_file_with_retrieval(
+        eval_file, retriever, max_questions=max_questions
+    )
+
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(augmented, fh, indent=2)
+
+    logger.info("Augmented eval file saved to %s", output_path)
+
+
+# ===========================================================================
+# Section 5 -- Interactive retrieval mode
+# ===========================================================================
+
+def interactive_retrieve(retriever: InternetRetriever) -> None:
+    """Simple REPL: type a question, get retrieved passages."""
+    print("\nHotpotQA Internet Retriever  (type 'quit' to exit)\n")
+    while True:
+        try:
+            query = input("Question> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not query or query.lower() in {"quit", "exit", "q"}:
+            break
+
+        results = retriever.retrieve(query)
+        if not results:
+            print("  [No results found]\n")
+            continue
+
+        for rank, res in enumerate(results, 1):
+            print(f"  [{rank}] {res['title']}  (score={res['score']:.3f})")
+            print(f"      {res['url']}")
+            snippet = res['text'][:300] + '...' if len(res['text']) > 300 else res['text']
+            print(f"      {snippet}")
+            print()
+
+
+# ===========================================================================
+# Section 6 -- Argument parser & main
+# ===========================================================================
+
+glove_word_file    = "glove.840B.300d.txt"
+word_emb_file      = "word_emb.json"
+char_emb_file      = "char_emb.json"
+train_eval         = "train_eval.json"
+dev_eval           = "dev_eval.json"
+test_eval          = "test_eval.json"
+word2idx_file      = "word2idx.json"
+char2idx_file      = "char2idx.json"
+idx2word_file      = "idx2word.json"
+idx2char_file      = "idx2char.json"
+train_record_file  = "train_record.pkl"
+dev_record_file    = "dev_record.pkl"
+test_record_file   = "test_record.pkl"
+
+parser = argparse.ArgumentParser(
+    description="HotpotQA main with internet retriever augmentation."
+)
+
+# Original pipeline args
+parser.add_argument("--mode", type=str, default="train",
+                    choices=["train", "prepro", "test",
+                             "retrieve", "retrieve_test"],
+                    help="Pipeline mode.")
+parser.add_argument("--data_file",        type=str)
+parser.add_argument("--glove_word_file",  type=str, default=glove_word_file)
+parser.add_argument("--save",             type=str, default="HOTPOT")
+parser.add_argument("--word_emb_file",    type=str, default=word_emb_file)
+parser.add_argument("--char_emb_file",    type=str, default=char_emb_file)
+parser.add_argument("--train_eval_file",  type=str, default=train_eval)
+parser.add_argument("--dev_eval_file",    type=str, default=dev_eval)
+parser.add_argument("--test_eval_file",   type=str, default=test_eval)
+parser.add_argument("--word2idx_file",    type=str, default=word2idx_file)
+parser.add_argument("--char2idx_file",    type=str, default=char2idx_file)
+parser.add_argument("--idx2word_file",    type=str, default=idx2word_file)
+parser.add_argument("--idx2char_file",    type=str, default=idx2char_file)
+parser.add_argument("--train_record_file",type=str, default=train_record_file)
+parser.add_argument("--dev_record_file",  type=str, default=dev_record_file)
+parser.add_argument("--test_record_file", type=str, default=test_record_file)
+parser.add_argument("--glove_char_size",  type=int, default=94)
+parser.add_argument("--glove_word_size",  type=int, default=int(2.2e6))
+parser.add_argument("--glove_dim",        type=int, default=300)
+parser.add_argument("--char_dim",         type=int, default=8)
+parser.add_argument("--para_limit",       type=int, default=1000)
+parser.add_argument("--ques_limit",       type=int, default=80)
+parser.add_argument("--sent_limit",       type=int, default=100)
+parser.add_argument("--char_limit",       type=int, default=16)
+parser.add_argument("--batch_size",       type=int, default=64)
+parser.add_argument("--checkpoint",       type=int, default=1000)
+parser.add_argument("--period",           type=int, default=100)
+parser.add_argument("--init_lr",          type=float, default=0.5)
+parser.add_argument("--keep_prob",        type=float, default=0.8)
+parser.add_argument("--hidden",           type=int, default=80)
+parser.add_argument("--char_hidden",      type=int, default=100)
+parser.add_argument("--patience",         type=int, default=1)
+parser.add_argument("--seed",             type=int, default=13)
+parser.add_argument("--sp_lambda",        type=float, default=0.0)
+parser.add_argument("--data_split",       type=str, default="train")
+parser.add_argument("--fullwiki",         action="store_true")
+parser.add_argument("--prediction_file",  type=str)
+parser.add_argument("--sp_threshold",     type=float, default=0.3)
+
+# Retriever-specific args
+parser.add_argument("--ret_top_k_titles",   type=int,   default=5,
+                    help="Number of Wikipedia articles to retrieve per question.")
+parser.add_argument("--ret_top_k_passages", type=int,   default=3,
+                    help="Number of passages to keep after BM25 ranking.")
+parser.add_argument("--ret_chunk_size",     type=int,   default=5,
+                    help="Sentences per passage chunk.")
+parser.add_argument("--ret_chunk_overlap",  type=int,   default=1,
+                    help="Sentence overlap between consecutive chunks.")
+parser.add_argument("--ret_use_full_text",  action="store_true",
+                    help="Fetch full article text instead of intro only.")
+parser.add_argument("--ret_cache_dir",      type=str,   default=None,
+                    help="Directory to cache fetched article text.")
+parser.add_argument("--ret_augmented_eval", type=str,   default=None,
+                    help="Output path for the retrieval-augmented eval file "
+                         "(retrieve_test mode).")
+parser.add_argument("--ret_max_questions",  type=int,   default=None,
+                    help="Limit retrieval to this many questions (debug).")
+parser.add_argument("--ret_delay",          type=float, default=0.3,
+                    help="Seconds between Wikipedia API calls.")
+
+config = parser.parse_args()
+
+
+def _concat(filename: str) -> str:
+    if config.fullwiki:
+        return "fullwiki.{}".format(filename)
+    return filename
+
+
+config.dev_record_file  = _concat(config.dev_record_file)
+config.test_record_file = _concat(config.test_record_file)
+config.dev_eval_file    = _concat(config.dev_eval_file)
+config.test_eval_file   = _concat(config.test_eval_file)
+
+
+def _build_retriever() -> InternetRetriever:
+    return InternetRetriever(
+        top_k_titles=config.ret_top_k_titles,
+        top_k_passages=config.ret_top_k_passages,
+        chunk_size=config.ret_chunk_size,
+        chunk_overlap=config.ret_chunk_overlap,
+        use_full_text=config.ret_use_full_text,
+        cache_dir=config.ret_cache_dir,
+    )
+
+
+if config.mode == "train":
+    train(config)
+elif config.mode == "prepro":
+    prepro(config)
+elif config.mode == "test":
+    test(config)
+elif config.mode == "retrieve":
+    # Interactive retrieval REPL
+    interactive_retrieve(_build_retriever())
+elif config.mode == "retrieve_test":
+    # Retrieve passages, augment the eval file, then run inference
+    retriever = _build_retriever()
+    augmented_eval_path = config.ret_augmented_eval or (
+        config.test_eval_file.replace(".json", ".retrieved.json")
+    )
+    retrieve_and_save(
+        config.test_eval_file,
+        augmented_eval_path,
+        retriever,
+        max_questions=config.ret_max_questions,
+    )
+    # Swap in the augmented eval file and run the normal test pipeline
+    config.test_eval_file = augmented_eval_path
+    test(config)
