@@ -25,6 +25,7 @@ import time
 import json
 import logging
 import argparse
+import urllib.parse
 from typing import List, Dict, Tuple, Optional
 
 # ---------------------------------------------------------------------------
@@ -60,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# Section 1 -- Low-level HTTP helpers
+# Section 1 -- Low-level HTTP / Search helpers
 # ===========================================================================
 
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
@@ -120,8 +121,7 @@ def fetch_wikipedia_intro(
     """Fetch the introductory paragraph of a Wikipedia article.
 
     Returns the text as a single string (sentences joined by spaces).
-    Falls back to an empty string on any error.
-    """
+    Falls back to an empty string on any error."""
     session = _get_session()
     params = {
         "action": "query",
@@ -136,9 +136,9 @@ def fetch_wikipedia_intro(
         resp.raise_for_status()
         pages = resp.json().get("query", {}).get("pages", {})
         for page in pages.values():
-            extract = page.get("extract", "").strip()
+            extract = page.get("extract", \"\").strip()
             if extract:
-                sentences = re.split(r"(?<=[.!?])\s+", extract)
+                sentences = re.split(r\"(?<=[.!?])\s+\", extract)
                 return " ".join(sentences[:max_sentences])
         return ""
     except Exception as exc:  # noqa: BLE001
@@ -173,6 +173,96 @@ def fetch_wikipedia_full_text(
         return text
     except Exception as exc:  # noqa: BLE001
         logger.warning("fetch_wikipedia_full_text('%s') failed: %s", title, exc)
+        return ""
+
+
+def search_duckduckgo(
+    query: str,
+    top_k: int = 5,
+    timeout: float = 5.0,
+) -> List[Tuple[str, str]]:
+    """Return up to *top_k* search results (title, url) from DuckDuckGo.
+
+    Uses DuckDuckGo HTML interface which is clean and requires no API key.
+    """
+    if requests is None or BeautifulSoup is None:
+        logger.warning("requests or bs4 not installed. Cannot perform web search.")
+        return []
+
+    session = _get_session()
+    url = "https://html.duckduckgo.com/html/"
+    params = {"q": query}
+    try:
+        resp = session.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        results: List[Tuple[str, str]] = []
+        for a in soup.find_all("a", class_="result__url"):
+            href = a.get("href", "")
+            title = a.get_text().strip()
+            
+            # Decode DDG redirection wrapper if present
+            if "/l/?" in href:
+                parsed = urllib.parse.urlparse(href)
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "uddg" in qs:
+                    href = qs["uddg"][0]
+                    
+            if href and href.startswith("http") and "duckduckgo.com" not in href:
+                results.append((title or "Web Result", href))
+                if len(results) >= top_k:
+                    break
+        return results
+    except Exception as exc:
+        logger.warning("search_duckduckgo failed: %s", exc)
+        return []
+
+
+def fetch_general_url_text(
+    url: str,
+    timeout: float = 8.0,
+) -> str:
+    """Fetch and extract clean plain text from a general web page.
+
+    Strips scripts, styles, navigation, footer, header, and sidebar elements,
+    returning clean readable paragraphs separated by double newlines.
+    """
+    if requests is None or BeautifulSoup is None:
+        logger.warning("requests or bs4 not installed. Cannot fetch URL content.")
+        return ""
+
+    session = _get_session()
+    try:
+        resp = session.get(url, timeout=timeout)
+        resp.raise_for_status()
+        
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # Decompose non-content elements
+        for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
+            element.decompose()
+            
+        paragraphs = []
+        for p in soup.find_all(["p", "article", "section", "div"]):
+            if p.name == "div" and (len(p.find_all("div")) > 2 or len(p.get_text(strip=True)) < 40):
+                continue
+            text = p.get_text().strip()
+            text = re.sub(r"\s+", " ", text)
+            if len(text) > 40:
+                paragraphs.append(text)
+                
+        # Remove duplicates while maintaining order
+        seen = set()
+        unique_paras = []
+        for p in paragraphs:
+            if p not in seen:
+                seen.add(p)
+                unique_paras.append(p)
+                
+        return "\n\n".join(unique_paras)
+    except Exception as exc:
+        logger.warning("fetch_general_url_text('%s') failed: %s", url, exc)
         return ""
 
 
@@ -248,19 +338,21 @@ def bm25_rank(
 class InternetRetriever:
     """Retrieve and rank web / Wikipedia passages for a natural-language query.
 
+    Supports both specialized Wikipedia searching and broader general web searching.
+
     Usage::
 
-        retriever = InternetRetriever(top_k_titles=5, top_k_passages=3)
+        retriever = InternetRetriever(top_k_titles=5, top_k_passages=3, retriever_source="all")
         results = retriever.retrieve("Who was the first person to walk on the Moon?")
         for passage in results:
             print(passage["title"], "|", passage["score"])
             print(passage["text"])
 
     Each result dict has the keys:
-        ``title``   -- Wikipedia article title.
+        ``title``   -- Wikipedia article title or web page domain/title.
         ``text``    -- Retrieved passage text.
         ``score``   -- BM25 relevance score (float).
-        ``url``     -- Canonical Wikipedia URL.
+        ``url``     -- Canonical URL.
     """
 
     WIKI_BASE_URL = "https://en.wikipedia.org/wiki/"
@@ -273,14 +365,16 @@ class InternetRetriever:
         chunk_overlap: int = 1,
         use_full_text: bool = False,
         cache_dir: Optional[str] = None,
+        retriever_source: str = "all",
     ) -> None:
         self.top_k_titles = top_k_titles
         self.top_k_passages = top_k_passages
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.use_full_text = use_full_text
-        self._cache: Dict[str, str] = {}  # title -> article text
+        self._cache: Dict[str, str] = {}  # title or URL -> page/article text
         self.cache_dir = cache_dir
+        self.retriever_source = retriever_source
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
 
@@ -288,46 +382,49 @@ class InternetRetriever:
     # Cache helpers
     # ------------------------------------------------------------------
 
-    def _cache_path(self, title: str) -> str:
-        safe = re.sub(r"[^\w\-]", "_", title)
+    def _cache_path(self, title_or_url: str) -> str:
+        safe = re.sub(r"[^\w\-]", "_", title_or_url)
         return os.path.join(self.cache_dir, f"{safe}.txt")  # type: ignore
 
-    def _load_from_disk(self, title: str) -> Optional[str]:
+    def _load_from_disk(self, title_or_url: str) -> Optional[str]:
         if not self.cache_dir:
             return None
-        path = self._cache_path(title)
+        path = self._cache_path(title_or_url)
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
                 return fh.read()
         return None
 
-    def _save_to_disk(self, title: str, text: str) -> None:
+    def _save_to_disk(self, title_or_url: str, text: str) -> None:
         if not self.cache_dir:
             return
-        path = self._cache_path(title)
+        path = self._cache_path(title_or_url)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
 
     # ------------------------------------------------------------------
-    # Article fetching
+    # Article / Page fetching
     # ------------------------------------------------------------------
 
-    def _get_article_text(self, title: str) -> str:
-        """Return article text, using in-memory then disk cache."""
-        if title in self._cache:
-            return self._cache[title]
-        disk_text = self._load_from_disk(title)
+    def _get_page_text(self, title_or_url: str, is_url: bool = False) -> str:
+        """Return article or webpage text, using in-memory then disk cache."""
+        if title_or_url in self._cache:
+            return self._cache[title_or_url]
+        disk_text = self._load_from_disk(title_or_url)
         if disk_text is not None:
-            self._cache[title] = disk_text
+            self._cache[title_or_url] = disk_text
             return disk_text
 
-        if self.use_full_text:
-            text = fetch_wikipedia_full_text(title)
+        if is_url:
+            text = fetch_general_url_text(title_or_url)
         else:
-            text = fetch_wikipedia_intro(title)
+            if self.use_full_text:
+                text = fetch_wikipedia_full_text(title_or_url)
+            else:
+                text = fetch_wikipedia_intro(title_or_url)
 
-        self._cache[title] = text
-        self._save_to_disk(title, text)
+        self._cache[title_or_url] = text
+        self._save_to_disk(title_or_url, text)
         return text
 
     # ------------------------------------------------------------------
@@ -340,12 +437,11 @@ class InternetRetriever:
         top_k_titles: Optional[int] = None,
         top_k_passages: Optional[int] = None,
     ) -> List[Dict]:
-        """Retrieve the most relevant passages for *query*.
+        """Retrieve the most relevant passages for *query* from selected sources.
 
         Args:
             query:          Natural-language question or query string.
-            top_k_titles:   Override instance default for number of Wikipedia
-                            titles to search.
+            top_k_titles:   Override instance default for number of sources to search.
             top_k_passages: Override instance default for number of final
                             passages to return.
 
@@ -355,45 +451,54 @@ class InternetRetriever:
         n_titles = top_k_titles or self.top_k_titles
         n_passages = top_k_passages or self.top_k_passages
 
-        # 1. Retrieve candidate article titles
-        titles = wikipedia_search_titles(query, top_k=n_titles)
-        if not titles:
-            logger.warning("No Wikipedia titles found for query: %s", query)
-            return []
+        all_passages: List[Tuple[str, str, str]] = []  # (title, passage, url)
 
-        # 2. Fetch article text and split into passages
-        all_passages: List[Tuple[str, str]] = []  # (title, passage)
-        for title in titles:
-            text = self._get_article_text(title)
-            if not text:
-                continue
-            chunks = chunk_text(text, self.chunk_size, self.chunk_overlap)
-            for chunk in chunks:
-                all_passages.append((title, chunk))
+        # 1. Wikipedia Retrieval
+        if self.retriever_source in ["wikipedia", "all"]:
+            titles = wikipedia_search_titles(query, top_k=n_titles)
+            for title in titles:
+                text = self._get_page_text(title, is_url=False)
+                if not text:
+                    continue
+                chunks = chunk_text(text, self.chunk_size, self.chunk_overlap)
+                url = self.WIKI_BASE_URL + title.replace(" ", "_")
+                for chunk in chunks:
+                    all_passages.append((title, chunk, url))
+
+        # 2. General Web Retrieval (DuckDuckGo)
+        if self.retriever_source in ["web", "all"]:
+            web_results = search_duckduckgo(query, top_k=n_titles)
+            for title, url in web_results:
+                text = self._get_page_text(url, is_url=True)
+                if not text:
+                    continue
+                chunks = chunk_text(text, self.chunk_size, self.chunk_overlap)
+                for chunk in chunks:
+                    all_passages.append((title, chunk, url))
 
         if not all_passages:
+            logger.warning("No passages retrieved for query: %s", query)
             return []
 
         # 3. Rank all passages with BM25
         passage_texts = [p[1] for p in all_passages]
         ranked = bm25_rank(query, passage_texts, top_k=n_passages)
 
-        # 4. Re-attach titles and build result dicts
-        # Build a reverse lookup: text -> title (first occurrence)
-        text_to_title: Dict[str, str] = {}
-        for title, passage in all_passages:
-            if passage not in text_to_title:
-                text_to_title[passage] = title
+        # 4. Re-attach metadata and build result dicts
+        text_to_meta: Dict[str, Tuple[str, str]] = {}
+        for title, passage, url in all_passages:
+            if passage not in text_to_meta:
+                text_to_meta[passage] = (title, url)
 
         results: List[Dict] = []
         for score, passage in ranked:
-            title = text_to_title.get(passage, "Unknown")
+            title, url = text_to_meta.get(passage, ("Unknown", ""))
             results.append(
                 {
                     "title": title,
                     "text": passage,
                     "score": float(score),
-                    "url": self.WIKI_BASE_URL + title.replace(" ", "_"),
+                    "url": url,
                 }
             )
         return results
@@ -404,16 +509,7 @@ class InternetRetriever:
         delay: float = 0.5,
         **kwargs,
     ) -> List[List[Dict]]:
-        """Run retrieval for a list of queries with an inter-request delay.
-
-        Args:
-            queries: List of question strings.
-            delay:   Seconds to sleep between requests (be a polite citizen).
-            **kwargs: Forwarded to :meth:`retrieve`.
-
-        Returns:
-            List of result lists, one per query.
-        """
+        """Run retrieval for a list of queries with an inter-request delay."""
         all_results = []
         for i, query in enumerate(queries):
             logger.info("[%d/%d] Retrieving: %s", i + 1, len(queries), query)
@@ -434,23 +530,7 @@ def augment_eval_file_with_retrieval(
     max_questions: Optional[int] = None,
     delay: float = 0.3,
 ) -> Dict:
-    """Inject retrieved passages into a HotpotQA eval-file dict.
-
-    For each question in *eval_file* the retriever is called and the top
-    passages are prepended to the existing ``context`` field.  This allows
-    the downstream model to consider web evidence even in the fullwiki
-    distractor setting.
-
-    Args:
-        eval_file:      The loaded JSON eval file (dict keyed by question id).
-        retriever:      An :class:`InternetRetriever` instance.
-        max_questions:  Process at most this many questions (for debugging).
-        delay:          Seconds between retrieval requests.
-
-    Returns:
-        A new dict with the same structure as *eval_file* but with augmented
-        ``context`` entries.
-    """
+    """Inject retrieved passages into a HotpotQA eval-file dict."""
     augmented: Dict = {}
     items = list(eval_file.items())
     if max_questions:
@@ -593,8 +673,11 @@ parser.add_argument("--prediction_file",  type=str)
 parser.add_argument("--sp_threshold",     type=float, default=0.3)
 
 # Retriever-specific args
+parser.add_argument("--ret_source",         type=str,   default="all",
+                    choices=["wikipedia", "web", "all"],
+                    help="Retrieval source: wikipedia, web (DuckDuckGo), or all.")
 parser.add_argument("--ret_top_k_titles",   type=int,   default=5,
-                    help="Number of Wikipedia articles to retrieve per question.")
+                    help="Number of source articles/websites to retrieve per question.")
 parser.add_argument("--ret_top_k_passages", type=int,   default=3,
                     help="Number of passages to keep after BM25 ranking.")
 parser.add_argument("--ret_chunk_size",     type=int,   default=5,
@@ -602,16 +685,16 @@ parser.add_argument("--ret_chunk_size",     type=int,   default=5,
 parser.add_argument("--ret_chunk_overlap",  type=int,   default=1,
                     help="Sentence overlap between consecutive chunks.")
 parser.add_argument("--ret_use_full_text",  action="store_true",
-                    help="Fetch full article text instead of intro only.")
+                    help="Fetch full article text instead of intro only (Wikipedia only).")
 parser.add_argument("--ret_cache_dir",      type=str,   default=None,
-                    help="Directory to cache fetched article text.")
+                    help="Directory to cache fetched article/webpage text.")
 parser.add_argument("--ret_augmented_eval", type=str,   default=None,
                     help="Output path for the retrieval-augmented eval file "
                          "(retrieve_test mode).")
 parser.add_argument("--ret_max_questions",  type=int,   default=None,
                     help="Limit retrieval to this many questions (debug).")
 parser.add_argument("--ret_delay",          type=float, default=0.3,
-                    help="Seconds between Wikipedia API calls.")
+                    help="Seconds between HTTP/API calls.")
 
 config = parser.parse_args()
 
@@ -636,6 +719,7 @@ def _build_retriever() -> InternetRetriever:
         chunk_overlap=config.ret_chunk_overlap,
         use_full_text=config.ret_use_full_text,
         cache_dir=config.ret_cache_dir,
+        retriever_source=config.ret_source,
     )
 
 
